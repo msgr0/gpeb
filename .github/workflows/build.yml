@@ -1,0 +1,83 @@
+name: build
+
+# Builds only on demand: run it by hand to test a branch, then publish a
+# release and the same build attaches the three binaries to it.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:   # manual run on any branch, from the Actions tab
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: linux-x86_64,  static: -static }
+          - { os: ubuntu-24.04-arm, target: linux-aarch64, static: -static }
+          # Apple does not support static linking (no static libSystem); libz
+          # ships with the OS, so the dynamic binary still runs anywhere.
+          - { os: macos-latest,     target: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write   # gh release upload
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch gfatools (the only submodule gpeb needs)
+        run: git submodule update --init --depth 1 libs/gfatools
+
+      # Preinstalled on ubuntu-latest, but -static needs libz.a specifically.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y zlib1g-dev
+
+      - name: Build libgfa1.a
+        run: make -C libs/gfatools libgfa1.a
+
+      # Build through the Makefile, as users do: it compiles with -std=c11, under
+      # which glibc hides every POSIX declaration, so a build that works with a
+      # bare `cc` can still fail for anyone running `make gpeb` -- exactly what
+      # happened when the phase timing added clock_gettime. NATIVE= keeps the
+      # binary portable; Linux links statically so it does not depend on the
+      # runner's glibc/zlib.
+      - name: Build gpeb
+        run: make gpeb NATIVE= LDFLAGS=${{ matrix.static }}
+
+      - name: Self-test
+        run: make test
+
+      - run: ./gpeb --help || true
+
+      # Options that take a value must refuse to swallow the next option, an unknown
+      # option must not fall through to the input filename, and --span/--threads must
+      # reject values out of range. `! cmd` does not fail a `bash -e` step (only the
+      # last one would), so each check tests the exit status itself.
+      - name: Reject malformed command lines
+        run: |
+          must_fail() { if "$@" >/dev/null 2>&1; then echo "accepted, should fail: $*"; exit 1; fi; }
+          must_fail ./gpeb --classify 31 --keep-ambiguous reads.fa
+          must_fail ./gpeb --index 31 --span out.pex g.gfa
+          must_fail ./gpeb --labell g.gfa
+          must_fail ./gpeb --span
+          must_fail ./gpeb --minimal --acyclic g.gfa
+          must_fail ./gpeb --span 0 g.gfa
+          must_fail ./gpeb --span 4294967296 g.gfa
+          must_fail ./gpeb --span 12x g.gfa
+          must_fail ./gpeb --threads 65 g.gfa
+
+      - name: Self-test of the compress grouping
+        run: sh test_gpeb_compress.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpeb-${{ matrix.target }}
+          path: gpeb
+
+      # Each job uploads its own binary; --clobber so "Re-run jobs" can replace it.
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        run: |
+          cp gpeb gpeb-${{ matrix.target }}
+          gh release upload "$GITHUB_REF_NAME" gpeb-${{ matrix.target }} --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

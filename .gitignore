@@ -1,0 +1,23 @@
+# build products
+*.o
+*.a
+/gpeb
+/gpeb-test
+
+# editors / OS
+.vscode/
+*.code-workspace
+.DS_Store
+
+# make
+.build-flags
+
+# gpeb outputs and self-test leftovers
+*.pex
+*.pex.tmp
+*.gfai
+*.gfai.tmp
+*.out.gfa
+*.path.tsv
+*.sets.tsv
+gpeb_*selftest*
