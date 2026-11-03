@@ -1,4 +1,6 @@
-# gpeb
+![gpeb logo](logo.jpeg)
+
+<!-- # gpeb -->
 
 Graph pebbling for pangenome graphs: path inference and graph personalization.
 
