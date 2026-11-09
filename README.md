@@ -61,6 +61,17 @@ makes `gpeb` refuse an index built from a different graph.
 gpeb --use-index graph.pex --classify 31 reads.fq.gz graph.gfa > reads.tsv
 ```
 
+To call the sample behind the reads, take each read's most-voted haplotypes and rank
+the samples:
+
+```bash
+gpeb --use-index graph.pex --top 0 --classify 31 reads.fq.gz --set-call mode > /dev/null
+```
+
+Its `set-call[conf]` line qualifies the call: `D`, the call's margin over the hardest
+competing sample on the reads that tell the two apart (accept the call when D >= 1/4),
+and `pi`, each sample's share of the reads.
+
 ### Personalised graph (cover)
 
 For a sample that is not in the panel, `--set-call cover` picks, per 200 kb window, the
@@ -88,8 +99,8 @@ Not covered above; each is described by `./gpeb --help`.
   `--from-peb`
 - Guardian filters: `--min-gap`, `--min-complexity`, `--colors`, `--color-sep`
 - Index variants: `--keep-ambiguous`, `--keep-many`, `--fast-mask`, `--tol`,
-  `--index-all`, `--subsample`
-- Whole-set calls: `--set-call all|fraction|intersect|vote|sample|mosaic|cover`, `--top`
+  `--index-all`, `--subsample`, `--max-colours`, `--walk-dedup`
+- Whole-set calls: `--set-call all|fraction|intersect|vote|sample|mode|mosaic|cover`, `--top`
 - Cover tuning: `--cover-window`, `--cover-max`, `--cover-min-frac`, `--cover-min-gain`,
   `--cover-stray`, `--cover-rule`, `--cover-weight`, `--mosaic-check`
 - Mosaic (two recombining haplotype tracks): `--set-call mosaic`, `--mosaic-block`,
@@ -97,7 +108,12 @@ Not covered above; each is described by `./gpeb --help`.
 - Splicing a saved painting without reads: `--mosaic-splice`, `--make-gfai`, `--no-gfai`
 - Splitting a large panel into one index per group: `--split-colors`, `--split-max-colors`,
   `--split-walk`, `--split-shared`, `--split-exclude`, `--split-dry-run`
-- Diagnostics: `--kmer-stats`, `--pebble-ambiguity`
+- Diagnostics: `--kmer-stats`, `--pebble-ambiguity`, `--panel-jaccard`
+
+## Reproducing the paper
+
+`workflows/recomb27` is the Snakemake workflow behind every result of the RECOMB 2027
+paper, from the HPRC release 2.1 graphs and GIAB reads; see its `README.md`.
 
 ## License
 

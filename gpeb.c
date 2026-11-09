@@ -34,6 +34,7 @@
 #endif
 
 #define GSPAN   30               // default --span window (bp)
+#define GMINGAP 60               // default --min-gap (bp)
 #define UNREACH UINT32_MAX
 
 // bg_t  = bidirected graph (orientation-preserving "st-graph")
@@ -925,14 +926,16 @@ static uint64_t fnv1a(const void *p, size_t n, uint64_t h) {
   return h;
 }
 
-// Grow and rehash. Linear probing loops forever on a full table, so the load factor is
-// enforced (the number of window k-mers is not known in advance).
-static void kh_grow(kh_t *h) {
-  size_t ocap = h->mask + 1, ncap = ocap * 2;
+// Grow and rehash. Open addressing with linear probing loops forever once the
+// table is full, so the load factor must be enforced, not assumed: the number of
+// window k-mers is ~(2*span-k+1) per window and is not known in advance.
+static void kh_resize(kh_t *h, size_t ncap) {
+  size_t ocap = h->mask + 1;
   uint64_t *ok = h->key, *ol = h->loc; uint8_t *os = h->st;
   h->key = malloc(ncap * sizeof(uint64_t));
   h->loc = ol ? malloc(ncap * sizeof(uint64_t)) : NULL;
   h->st  = calloc(ncap, 1);
+  if (!h->key || (ol && !h->loc) || !h->st) { fprintf(stderr, "kh: out of memory (%zu slots)\n", ncap); exit(1); }
   h->mask = ncap - 1;
   for (size_t j = 0; j < ocap; j++) {
     if (os[j] == KH_EMPTY) continue;
@@ -942,6 +945,16 @@ static void kh_grow(kh_t *h) {
     if (ol) h->loc[i] = ol[j];
   }
   free(ok); free(ol); free(os);
+}
+static void kh_grow(kh_t *h) { kh_resize(h, (h->mask + 1) * 2); }
+
+// kh_new sizes from a hint (pidx_build: the guardian count, which overshoots the
+// distinct k-mers a lot). Once the table has stopped growing, shrink it to the
+// smallest power of two at <=50% load, so whatever is sized per slot afterwards
+// (the nw-word color masks) is sized by what the table holds.
+static void kh_compact(kh_t *h) {
+  size_t cap = 16; while (cap < h->n * 2) cap <<= 1;
+  if (cap < h->mask + 1) kh_resize(h, cap);
 }
 
 // Slot of `key`, inserting it as KH_WANT when `insert`; SIZE_MAX if absent. The EMPTY
@@ -1095,15 +1108,19 @@ static kh_t *kmer_insert(const bg_t *g, const gset_t *gs, uint32_t span, uint32_
                          size_t *nwin_out, int all_kmers, int junc_only, uint32_t sk) {
   if (k < 2 || k > 31) { fprintf(stderr, "kmer: k must be in [2,31]\n"); return NULL; }
   if (sk && (sk < 2 || sk >= k)) {
-    fprintf(stderr, "kmer: --syncmer s must be in [2,%u) for k=%u\n", k, k); return NULL;
+    fprintf(stderr, "kmer: --syncmer s must be in [2,%u) for k=%u (the default is s=16;"
+                    " --syncmer 0 indexes every k-mer)\n", k, k); return NULL;
   }
   char *buf = malloc(2 * (span ? span : 1));
   kroll_t q; kr_init(&q, k, sk);
   size_t ncand = 0, nkept = 0, ndark = 0;
 
-  // Dedupe windows by content hash and collect their k-mers.
-  kh_t *wseen = kh_new(gs->n ? gs->n : 1, 0);         // distinct window hashes
-  kh_t *km    = kh_new(gs->n ? (size_t)gs->n * 4 : 16, 1);  // locates: needs loc
+  // 1) dedupe windows by content hash, and collect their k-mers.
+  // Both start small and grow: gs->n counts guardians, not distinct windows or
+  // k-mers, and sizing from it made this phase the peak of the whole build (chr21:
+  // 35 GB here against 11 GB once compacted). Doubling costs ~2x rehash, not RSS.
+  kh_t *wseen = kh_new(1 << 20, 0);                   // distinct window hashes
+  kh_t *km    = kh_new(1 << 20, 1);                   // locates: needs loc
   size_t nwin = 0;
   if (all_kmers) {
     for (uint32_t w = 0; w < g->np; w++) {
@@ -1346,9 +1363,162 @@ static void kmer_locate_color(const bg_t *g, kh_t *km, uint32_t k,
   par_for(g->np, nthreads, walk_process_one, &j);
 }
 
-// segcolor[seg] = union of colors of every walk traversing seg in either orientation,
-// i.e. the color set of any interior k-mer of that segment. One pass over the walks'
-// vertex lists rather than their bases.
+// ---- --walk-dedup : the junction pass once per distinct CONTEXT, not per walk --
+// What walk_process_one does at step s of a walk with skip_interior -- the k-mers
+// ending in the first k-1 bases of s's vertex, each probed, marked at its locus and
+// given the walk's colour -- is fixed by s's CONTEXT: the vertices covering the k-1
+// bases before s (fewer if the walk starts sooner) and s's own vertex. Walks share
+// contexts massively (chr20, 462 colours: 854.7 M steps, 13.5 M distinct contexts
+// read either way), and kh_mark and the colour OR are idempotent and order-free, so
+// pass A hashes each step's context into a table that keeps, per distinct context,
+// one (walk, step) to replay it from and the union of the colours of the walks that
+// read it; pass B replays each context once over at most 2(k-1) bases, marking its
+// keys with that union. Same events, same verdicts: the table, and the .pex, are
+// identical to the plain stream. Costs one step-level pass plus ~(8+8+4) B a table
+// slot and 8 + 8*nw B a context.
+static int walk_dedup = 0;                            // --walk-dedup
+
+typedef struct {
+  uint64_t *h1, *h2; uint32_t *id; size_t mask;       // open addressing, <= 50% load
+  uint32_t n, max; int over;                          // contexts handed out; cap; overflow
+  uint32_t *rw, *rs; uint64_t *cm; uint32_t nw;       // per context: walk, step, colours
+} wctx_t;
+
+// First step of s's context, and the bases it holds before s (< k-1 only when the
+// walk starts first).
+static inline uint32_t wctx_left(const bg_t *g, const uint32_t *pv, uint32_t s,
+                                 uint32_t need, uint64_t *acc) {
+  uint32_t j = s; *acc = 0;
+  while (j > 0 && *acc < need) { j--; *acc += nsl(g, pv[j]); }
+  return j;
+}
+
+// The context id of (h1, h2), inserted with (w, s) as its replay point if new.
+// Lock-free: a slot is claimed by CAS on h1, then h2 and the id are published
+// (id last, release); a reader that finds h1 waits for the id before comparing h2.
+// UINT32_MAX = the table is full (pass A restarts with a bigger one).
+static uint32_t wctx_get(wctx_t *t, uint64_t h1, uint64_t h2, uint32_t w, uint32_t s, int mt) {
+  for (size_t i = h1 & t->mask;; i = (i + 1) & t->mask) {
+    uint64_t cur = mt ? __atomic_load_n(&t->h1[i], __ATOMIC_ACQUIRE) : t->h1[i];
+    if (!cur) {
+      if (!mt) t->h1[i] = h1;
+      else { uint64_t z = 0;
+             if (!__atomic_compare_exchange_n(&t->h1[i], &z, h1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) cur = z; }
+      if (!cur) {                                     // this thread claimed the slot
+        uint32_t id = mt ? __atomic_fetch_add(&t->n, 1, __ATOMIC_RELAXED) : t->n++;
+        if (id >= t->max) {
+          __atomic_store_n(&t->over, 1, __ATOMIC_RELAXED);
+          if (mt) __atomic_store_n(&t->id[i], UINT32_MAX, __ATOMIC_RELEASE);
+          return UINT32_MAX;
+        }
+        t->h2[i] = h2; t->rw[id] = w; t->rs[id] = s;
+        if (mt) __atomic_store_n(&t->id[i], id + 1, __ATOMIC_RELEASE); else t->id[i] = id + 1;
+        return id;
+      }
+    }
+    if (cur != h1) continue;
+    uint32_t v;
+    if (mt) { while (!(v = __atomic_load_n(&t->id[i], __ATOMIC_ACQUIRE))) ; }
+    else v = t->id[i];
+    if (v == UINT32_MAX) return UINT32_MAX;
+    if (t->h2[i] == h2) return v - 1;
+  }
+}
+
+typedef struct { const bg_t *g; wctx_t *t; const uint32_t *color; uint32_t k; int mt; } wd_a_t;
+
+static void wd_pass_a(const void *ctx, uint32_t w) {
+  const wd_a_t *a = ctx; const bg_t *g = a->g; wctx_t *t = a->t;
+  const uint32_t *pv = g->pv[w]; uint32_t k = a->k, need = k - 1;
+  uint32_t cw = a->color[w] >> 6; uint64_t bit = 1ULL << (a->color[w] & 63);
+  for (uint32_t s = 1; s < g->pn[w]; s++) {
+    if (__atomic_load_n(&t->over, __ATOMIC_RELAXED)) return;
+    size_t L = nsl(g, pv[s]);
+    uint64_t acc; uint32_t j = wctx_left(g, pv, s, need, &acc);
+    if (acc + (L < need ? L : need) < k) continue;    // no k-mer ends in s's first k-1 bases
+    uint64_t h1 = 0x243F6A8885A308D3ULL + (acc < need), h2 = 0x13198A2E03707344ULL + (acc < need);
+    for (uint32_t i = j; i <= s; i++) {
+      h1 = h1 * 0x9E3779B97F4A7C15ULL + pv[i] + 1;
+      h2 = h2 * 0xC2B2AE3D27D4EB4FULL + pv[i] + 1;
+    }
+    h1 = kh_mix(h1); h2 = kh_mix(h2 ^ 0x5851F42D4C957F2DULL);
+    uint32_t id = wctx_get(t, h1 ? h1 : 1, h2, w, s, a->mt);
+    if (id == UINT32_MAX) return;
+    cm_or_atomic(&t->cm[(size_t)id * t->nw + cw], bit, a->mt);
+  }
+}
+
+typedef struct { const bg_t *g; kh_t *km; const wctx_t *t; uint64_t *cmask; uint32_t k, sk, nw; int mt; } wd_b_t;
+
+// Replays one context exactly as walk_process_one reads it: the last k-1 bases before
+// s (all of them at a walk start), then s's first k-1; only k-mers ending in s count.
+static void wd_pass_b(const void *ctx, uint32_t id) {
+  const wd_b_t *b = ctx; const bg_t *g = b->g; const wctx_t *t = b->t;
+  uint32_t w = t->rw[id], s = t->rs[id], k = b->k, need = k - 1, nw = b->nw;
+  const uint32_t *pv = g->pv[w];
+  uint64_t acc; uint32_t j = wctx_left(g, pv, s, need, &acc);
+  uint64_t skip = acc > need ? acc - need : 0;        // bases no k-mer ending in s reaches
+  const uint64_t *cm = t->cm + (size_t)id * nw;
+  uint32_t qv[32], qo[32]; int qh = 0;
+  kroll_t q; kr_init(&q, k, b->sk);
+  for (uint32_t i = j; i <= s; i++) {
+    uint32_t v = pv[i]; const char *sq = nseq(g, v);
+    size_t L = nsl(g, v), o0 = 0, o1 = L;
+    if (i < s) { if (skip >= L) { skip -= L; continue; } o0 = (size_t)skip; skip = 0; }
+    else if (o1 > need) o1 = need;
+    for (size_t o = o0; o < o1; o++) {
+      char c = (v & 1) ? (char)gfa_comp_table[(uint8_t)sq[L - 1 - o]] : sq[o];
+      qv[qh & 31] = v; qo[qh & 31] = (uint32_t)o; qh++;
+      if (kr_push(&q, c) != 1 || i < s) continue;
+      size_t sl = kh_slot(b->km, kr_key(&q), 0);
+      if (sl == (size_t)-1) continue;
+      int z0 = (qh - (int)k) & 31, z1 = (qh - 1) & 31;
+      uint64_t loc = kmer_locus(g, qv[z0], qo[z0], qv[z1], qo[z1]);
+      for (uint32_t z = 0; z < nw; z++)
+        if (cm[z]) cm_or_atomic(&b->cmask[(size_t)sl * nw + z], cm[z], b->mt);
+      kh_mark(b->km, sl, loc, b->mt);
+    }
+  }
+}
+
+static void kmer_locate_dedup(const bg_t *g, kh_t *km, uint32_t k, uint64_t *cmask,
+                              const uint32_t *color, uint32_t nw, int nthreads, uint32_t sk) {
+  int mt = nthreads >= 2;
+  uint64_t steps = 0;
+  for (uint32_t w = 0; w < g->np; w++) steps += g->pn[w];
+  size_t cap = (size_t)1 << 16;                       // ~8 contexts a segment before a retry
+  while (cap < (size_t)16 * (g->n / 2)) cap <<= 1;
+  for (;;) {
+    wctx_t t = {0};
+    t.mask = cap - 1; t.max = (uint32_t)(cap / 2 < UINT32_MAX - 1 ? cap / 2 : UINT32_MAX - 1); t.nw = nw;
+    t.h1 = calloc(cap, sizeof(uint64_t)); t.h2 = calloc(cap, sizeof(uint64_t));
+    t.id = calloc(cap, sizeof(uint32_t));
+    t.rw = malloc((size_t)t.max * sizeof(uint32_t)); t.rs = malloc((size_t)t.max * sizeof(uint32_t));
+    t.cm = calloc((size_t)t.max * nw, sizeof(uint64_t));
+    double t0 = now_s();
+    wd_a_t a = { g, &t, color, k, mt };
+    par_for(g->np, nthreads, wd_pass_a, &a);
+    double t1 = now_s();
+    if (!t.over) {
+      wd_b_t b = { g, km, &t, cmask, k, sk, nw, mt };
+      par_for(t.n, nthreads, wd_pass_b, &b);
+      fprintf(stderr, "walk-dedup: %llu walk steps -> %u contexts (%.1f steps each, table %zu);"
+                      " hash %.2fs  replay %.2fs\n", (unsigned long long)steps, t.n,
+              t.n ? (double)steps / t.n : 0.0, cap, t1 - t0, now_s() - t1);
+    } else fprintf(stderr, "walk-dedup: more than %u contexts, retrying with a table of %zu\n",
+                   t.max, cap * 2);
+    int again = t.over;
+    free(t.h1); free(t.h2); free(t.id); free(t.rw); free(t.rs); free(t.cm);
+    if (!again) return;
+    cap <<= 1;
+  }
+}
+
+// segcolor[seg] = union of colors of every walk that traverses `seg`, in either
+// orientation -- so it is exactly the color set an interior k-mer of that segment
+// carries, since such a k-mer depends only on the segment's own sequence. One pass
+// over the walks' VERTEX lists (344M on chr1) rather than their bases (20.5G):
+// cheap enough that it is never the bottleneck, only the thing that removes one.
 static uint64_t *build_segcolor(const bg_t *g, const uint32_t *color, uint32_t nw) {
   uint32_t nseg = g->n / 2;
   uint64_t *segcolor = calloc((size_t)nseg * nw, sizeof(uint64_t));
@@ -1475,6 +1645,7 @@ static void kstat(const bg_t *g, const gset_t *gs, uint32_t span, uint32_t k,
 #define SET_SAMPLE    4
 #define SET_MOSAIC    5      // paint the set with two recombining tracks (needs positions)
 #define SET_COVER     6      // per window of the chromosome, the few colours whose union covers the hits
+#define SET_MODE      7      // the sample call over each read's most-voted colours (ties kept), not its intersection
 
 // pidx_t = the classifiable index: junction k-mers -> mask of colors containing
 // them, plus the color names. Built from a graph (pidx_build) or loaded from a
@@ -1498,6 +1669,8 @@ typedef struct {
   char     *blk_ref;              // the colour whose walk(s) give the coordinates
 } pidx_t;
 #define PEX_F_FASTMASK 1u        // masks from pebble windows (--fast-mask), not the walks
+#define PEX_F_PRIVATE  2u        // every record has exactly one colour (--max-colours 1): written as PEX6
+#define PEX_F_POS      4u        // in a PEX6 file only: positions follow (never kept in memory)
 #define BLK_NONE 0xFFFFu         // a record with no position (off the reference, no neighbour)
 #define BLK_MAX  0xFFFEu         // the largest block id; a chromosome needs length/block < this
 
@@ -1737,7 +1910,13 @@ static pidx_t *pidx_build(const bg_t *g, const gset_t *gs, uint32_t span, uint32
   // Colors are collected during the locate pass; the KH_ONE/KH_MANY verdict is applied at
   // the end. cmask is sized after the insert pass, when the table stops growing; neither
   // locate pass inserts.
+  kh_compact(km);
   uint64_t *cmask = calloc((size_t)(km->mask + 1) * nw, sizeof(uint64_t));
+  if (!cmask) {
+    fprintf(stderr, "pidx_build: cannot allocate %.1f GB of colour masks (%zu slots x %u words)\n",
+            (double)(km->mask + 1) * nw * 8 / 1e9, km->mask + 1, nw);
+    exit(1);
+  }
 
   if (fast_mask) {
     t_a = now_s();
@@ -1766,7 +1945,8 @@ static pidx_t *pidx_build(const bg_t *g, const gset_t *gs, uint32_t span, uint32
   kmer_scan_segments(g, km, k, cmask, segcolor, nw, nthreads, sk);
   double t_seg = now_s() - t_a; t_a = now_s();
   free(segcolor);
-  kmer_locate_color(g, km, k, cmask, color, nw, 1, nthreads, sk);
+  if (walk_dedup) kmer_locate_dedup(g, km, k, cmask, color, nw, nthreads, sk);
+  else kmer_locate_color(g, km, k, cmask, color, nw, 1, nthreads, sk);
   double t_walk = now_s() - t_a; t_a = now_s();
 
   // KH_IDX marks the slots the index holds. The verdict must test the state: every k-mer
@@ -1951,6 +2131,13 @@ static void pebble_ambiguity(const bg_t *g, const gset_t *gs, const pidx_t *ix,
 #define PEX_MAGIC2 "PEX2"
 #define PEX_MAGIC4 "PEX4"
 #define PEX_MAGIC5 "PEX5"
+#define PEX_MAGIC6 "PEX6"
+// PEX6 = a PRIVATE-only index (--max-colours 1): every record has one colour, so it
+// stores that colour's uint16 id after the key instead of the nw-word mask (10 bytes
+// against 8 + 8*nw, 72 at 462 colours). The header is PEX4's, `flags` carrying
+// PEX_F_PRIVATE; PEX_F_POS says positions follow exactly as in PEX5 (header fields
+// after `flags`, a uint16 block id after each id). Read back, the id is expanded to
+// the one-bit mask, so classify sees the same pidx_t as for any other index.
 // PEX4 = PEX3 plus a `flags` word after `s` (PEX_F_*). It is written ONLY when a
 // flag is set, i.e. for a --fast-mask index, so every normal index stays PEX3
 // byte for byte and older readers keep reading it; a reader that cannot tell a
@@ -1975,6 +2162,18 @@ static uint64_t file_hash(const char *path, uint64_t *size_out) {
 }
 
 static int pex_write(const char *path, const pidx_t *ix, const char *src) {
+  int v6 = (ix->flags & PEX_F_PRIVATE) != 0;
+  uint64_t n = 0;
+  for (size_t s = 0; s <= ix->km->mask; s++) {
+    if (ix->km->st[s] != KH_IDX) continue;
+    n++;
+    if (v6 && cm_pop(ix->cmask + s * ix->nw, ix->nw) != 1) {   // refuse before a byte is written
+      fprintf(stderr, "pex: a private-only index must have one colour per record\n"); return -1;
+    }
+  }
+  if (v6 && ix->nc > 0xFFFFu) {
+    fprintf(stderr, "pex: %u colours do not fit a 16-bit colour id\n", ix->nc); return -1;
+  }
   // Written next to the target and renamed over it, so a full disk or a crash never
   // leaves a truncated index under the final name.
   char tmp[4096];
@@ -1991,7 +2190,8 @@ static int pex_write(const char *path, const pidx_t *ix, const char *src) {
   else { hh = ix->src_hash; hsz = ix->src_size; sp = ix->src_path; }
   uint32_t sl = (uint32_t)(sp ? strlen(sp) : 0);
   int v5 = ix->blk != NULL;
-  fwrite(v5 ? PEX_MAGIC5 : ix->flags ? PEX_MAGIC4 : PEX_MAGIC, 1, 4, f);
+  uint32_t wf = ix->flags | (v6 && v5 ? PEX_F_POS : 0);   // PEX6 says in `flags` whether positions follow
+  fwrite(v6 ? PEX_MAGIC6 : v5 ? PEX_MAGIC5 : ix->flags ? PEX_MAGIC4 : PEX_MAGIC, 1, 4, f);
   fwrite(&hh, sizeof hh, 1, f);
   fwrite(&hsz, sizeof hsz, 1, f);
   fwrite(&sl, sizeof sl, 1, f);
@@ -1999,7 +2199,7 @@ static int pex_write(const char *path, const pidx_t *ix, const char *src) {
   fwrite(&ix->k, sizeof ix->k, 1, f);
   fwrite(&ix->span, sizeof ix->span, 1, f);
   fwrite(&ix->sk, sizeof ix->sk, 1, f);
-  if (ix->flags || v5) fwrite(&ix->flags, sizeof ix->flags, 1, f);
+  if (ix->flags || v5) fwrite(&wf, sizeof wf, 1, f);
   if (v5) {
     uint32_t rl = (uint32_t)(ix->blk_ref ? strlen(ix->blk_ref) : 0);
     fwrite(&ix->blk_bp, sizeof ix->blk_bp, 1, f);
@@ -2013,14 +2213,16 @@ static int pex_write(const char *path, const pidx_t *ix, const char *src) {
     uint32_t L = (uint32_t)strlen(s);
     fwrite(&L, sizeof L, 1, f); fwrite(s, 1, L, f);
   }
-  uint64_t n = 0;
-  for (size_t s = 0; s <= ix->km->mask; s++)
-    if (ix->km->st[s] == KH_IDX) n++;
   fwrite(&n, sizeof n, 1, f);
   for (size_t s = 0; s <= ix->km->mask; s++)
     if (ix->km->st[s] == KH_IDX) {
       fwrite(&ix->km->key[s], sizeof(uint64_t), 1, f);
-      fwrite(ix->cmask + s * ix->nw, sizeof(uint64_t), ix->nw, f);
+      const uint64_t *m = ix->cmask + s * ix->nw;
+      if (v6) {
+        uint32_t z = 0; while (!m[z]) z++;               // the one set bit, checked above
+        uint16_t id = (uint16_t)(z * 64u + (uint32_t)__builtin_ctzll(m[z]));
+        fwrite(&id, sizeof id, 1, f);
+      } else fwrite(m, sizeof(uint64_t), ix->nw, f);
       if (v5) fwrite(&ix->blk[s], sizeof(uint16_t), 1, f);
     }
   // ferror is sticky: it reports any fwrite above that failed (e.g. ENOSPC); fflush and
@@ -2034,10 +2236,11 @@ static int pex_write(const char *path, const pidx_t *ix, const char *src) {
     return -1;
   }
   fprintf(stderr, "pex: wrote %s (%llu kmers, %u colors, k=%u span=%u s=%u,"
-                  " %zu B/record, src=%s%s%s)\n",
+                  " %zu B/record, src=%s%s%s%s)\n",
           path, (unsigned long long)n, ix->nc, ix->k, ix->span, ix->sk,
-          sizeof(uint64_t) * (1 + (size_t)ix->nw) + (v5 ? sizeof(uint16_t) : 0),
-          sp ? sp : "?", v5 ? ", positions on " : "", v5 ? ix->blk_ref : "");
+          (v6 ? sizeof(uint64_t) + sizeof(uint16_t) : sizeof(uint64_t) * (1 + (size_t)ix->nw))
+            + (v5 ? sizeof(uint16_t) : 0),
+          sp ? sp : "?", v6 ? ", private-only" : "", v5 ? ", positions on " : "", v5 ? ix->blk_ref : "");
   return 0;
 }
 
@@ -2045,14 +2248,16 @@ static pidx_t *pex_read(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "pex: cannot read %s\n", path); return NULL; }
   char magic[4];
-  int v3 = 0, v4 = 0, v5 = 0;
+  int v3 = 0, v4 = 0, v5 = 0, v6 = 0;
   if (fread(magic, 1, 4, f) != 4 ||
-      (!(v5 = !memcmp(magic, PEX_MAGIC5, 4)) && !(v4 = !memcmp(magic, PEX_MAGIC4, 4)) &&
+      (!(v6 = !memcmp(magic, PEX_MAGIC6, 4)) && !(v5 = !memcmp(magic, PEX_MAGIC5, 4)) &&
+       !(v4 = !memcmp(magic, PEX_MAGIC4, 4)) &&
        !(v3 = !memcmp(magic, PEX_MAGIC, 4)) && memcmp(magic, PEX_MAGIC2, 4))) {
-      fprintf(stderr, "pex: %s is not a %s, %s, %s or %s file"
+      fprintf(stderr, "pex: %s is not a %s, %s, %s, %s or %s file"
                       " (older indexes must be rebuilt)\n",
-            path, PEX_MAGIC5, PEX_MAGIC4, PEX_MAGIC, PEX_MAGIC2); fclose(f); return NULL;
+            path, PEX_MAGIC6, PEX_MAGIC5, PEX_MAGIC4, PEX_MAGIC, PEX_MAGIC2); fclose(f); return NULL;
   }
+  if (v6) v4 = 1;                                 // PEX6 is PEX4 with colour ids; positions per its flags
   if (v5) v4 = 1;                                 // PEX5 is PEX4 plus positions
   if (v4) v3 = 1;                                 // PEX4 is PEX3 plus flags
   pidx_t *ix = calloc(1, sizeof(pidx_t)); ix->own = 1;
@@ -2070,6 +2275,10 @@ static pidx_t *pex_read(const char *path) {
   ix->sk = 0;                                     // PEX2: no filter, every k-mer
   if (v3 && fread(&ix->sk, sizeof ix->sk, 1, f) != 1) goto bad;
   if (v4 && fread(&ix->flags, sizeof ix->flags, 1, f) != 1) goto bad;
+  if (v6) {                                       // positions or not is in the flags, then it is PEX5's
+    v5 = (ix->flags & PEX_F_POS) != 0;
+    ix->flags = (ix->flags & ~PEX_F_POS) | PEX_F_PRIVATE;
+  }
   if (v5) {
     uint32_t rl = 0;
     if (fread(&ix->blk_bp, sizeof ix->blk_bp, 1, f) != 1 ||
@@ -2106,7 +2315,11 @@ static pidx_t *pex_read(const char *path) {
     uint64_t key;
     if (fread(&key, sizeof key, 1, f) != 1) goto bad;
     size_t sl = kh_slot(ix->km, key, 1);          // the table never grows past here
-    if (fread(ix->cmask + sl * ix->nw, sizeof(uint64_t), ix->nw, f) != ix->nw) goto bad;
+    if (v6) {
+      uint16_t id;
+      if (fread(&id, sizeof id, 1, f) != 1 || id >= ix->nc) goto bad;
+      cm_set(ix->cmask + sl * ix->nw, id);
+    } else if (fread(ix->cmask + sl * ix->nw, sizeof(uint64_t), ix->nw, f) != ix->nw) goto bad;
     if (v5 && fread(&ix->blk[sl], sizeof(uint16_t), 1, f) != 1) goto bad;
     ix->km->st[sl] = KH_IDX;
   }
@@ -2115,6 +2328,7 @@ static pidx_t *pex_read(const char *path) {
   fprintf(stderr, "pex: loaded %s (%llu kmers, %u colors, k=%u span=%u s=%u%s",
           path, (unsigned long long)n, ix->nc, ix->k, ix->span, ix->sk,
           ix->flags & PEX_F_FASTMASK ? ", --fast-mask" : "");
+  if (v6) fprintf(stderr, ", private-only");
   if (v5) fprintf(stderr, ", positions on %s in %u bp blocks", ix->blk_ref, ix->blk_bp);
   fprintf(stderr, ")\n");
   return ix;
@@ -2151,12 +2365,37 @@ static size_t pex_subsample(pidx_t *ix, double rate, uint64_t seed) {
   return kept;
 }
 
+// ---- --max-colours : keep only the rare k-mers of a built index -------------
+// Keeps the records whose mask holds at most `max` colours; --max-colours 1 is the
+// PRIVATE k-mers, one colour each. Like --subsample it only drops records, so every
+// surviving mask is the true saturated one and soundness (the true colour is in every
+// hit mask) holds; a read just has fewer hits. The mask is a property of the INDEX'S
+// colours: on a --split-colors group "private" means private within that group.
+// max == 1 marks the index PEX_F_PRIVATE, which pex_write stores as a colour id per
+// record (PEX6) instead of the whole mask.
+static size_t pex_max_colours(pidx_t *ix, uint32_t max) {
+  size_t in = 0, kept = 0;
+  for (size_t s = 0; s <= ix->km->mask; s++) {
+    if (ix->km->st[s] != KH_IDX) continue;
+    in++;
+    uint32_t pc = cm_pop(ix->cmask + s * ix->nw, ix->nw);
+    if (pc >= 1 && pc <= max) { kept++; continue; }
+    ix->km->st[s] = KH_DROP;
+  }
+  ix->nkmer = kept;
+  if (max == 1) ix->flags |= PEX_F_PRIVATE;
+  fprintf(stderr, "max-colours: %zu -> %zu records (at most %u colour%s each)\n",
+          in, kept, max, max == 1 ? "" : "s");
+  return kept;
+}
+
 // ---- panel geometry ---------------------------------------------------------
 // Jaccard similarity of each colour's nearest neighbour, measured on the index itself.
 // The score a colour MISSING from the panel can reach rises with it: near-duplicate
 // members leave no gap between a true call and an impostor. One pass over the index, no
 // reads. Pairs are taken only over colours set in a mask, not over all |C|^2.
-static void panel_nn(const pidx_t *ix, uint32_t *nn, double *jac) {
+// `tsv` (--panel-jaccard), if not NULL, also gets every pair a < b as a row.
+static void panel_nn(const pidx_t *ix, uint32_t *nn, double *jac, FILE *tsv) {
   uint32_t nc = ix->nc, nw = ix->nw;
   uint64_t *cnt = calloc(nc ? nc : 1, sizeof(uint64_t));
   uint64_t *both = calloc((size_t)nc * nc + 1, sizeof(uint64_t));
@@ -2173,6 +2412,7 @@ static void panel_nn(const pidx_t *ix, uint32_t *nn, double *jac) {
       for (uint32_t j = i + 1; j < nb; j++) both[(size_t)bits[i] * nc + bits[j]]++;
     }
   }
+  if (tsv) fputs("a\tb\tn_a\tn_b\tshared\tjaccard\n", tsv);
   for (uint32_t a = 0; a < nc; a++) {
     nn[a] = a; jac[a] = 0.0;
     for (uint32_t b = 0; b < nc; b++) {
@@ -2181,17 +2421,15 @@ static void panel_nn(const pidx_t *ix, uint32_t *nn, double *jac) {
       uint64_t un = cnt[a] + cnt[b] - in;
       double j = un ? (double)in / (double)un : 0.0;
       if (j > jac[a]) { jac[a] = j; nn[a] = b; }
+      if (tsv && a < b)
+        fprintf(tsv, "%s\t%s\t%llu\t%llu\t%llu\t%.6f\n",
+                ix->cname[a] ? ix->cname[a] : "?", ix->cname[b] ? ix->cname[b] : "?",
+                (unsigned long long)cnt[a], (unsigned long long)cnt[b], (unsigned long long)in, j);
     }
   }
   free(cnt); free(both); free(bits);
 }
 
-// `topn`: ranks printed per set-call block; 0 = all, down to the first zero, so absence
-// from the list means exactly zero.
-// `tol` < 0 = not given: 1 (strict intersection) for a normal index, 0.9 for a
-// --fast-mask one. Below 1 a read's set is every colour present in at least
-// ceil(tol * hits) of its hit k-mers' masks (read off `votes`); at 1 it is the plain
-// intersection and the code path is the untouched one.
 // One whole line, EOL kept, into *line (grown as needed); 0 at the end of the file.
 // gzgets alone stops at the buffer size, which would split a long-read line in two.
 static int gz_line(gzFile fp, char **line, size_t *cap) {
@@ -2205,10 +2443,108 @@ static int gz_line(gzFile fp, char **line, size_t *cap) {
   return 1;
 }
 
+// The distinct SAMPLE sets S(r) of a read set, with their counts: open addressing, count 0 = empty slot.
+typedef struct { uint64_t *key; uint32_t *ct; uint32_t cap, n, nw; } sset_t;
+static void sset_add(sset_t *t, const uint64_t *s, uint32_t m) {
+  if (2 * (t->n + 1) > t->cap) {                      // grow x2 and reinsert (never recurses past one level)
+    sset_t o = *t;
+    t->cap = o.cap ? 2 * o.cap : 1024; t->n = 0;
+    t->key = calloc((size_t)t->cap * t->nw, sizeof(uint64_t)); t->ct = calloc(t->cap, sizeof(uint32_t));
+    for (uint32_t i = 0; i < o.cap; i++) if (o.ct[i]) sset_add(t, o.key + (size_t)i * o.nw, o.ct[i]);
+    free(o.key); free(o.ct);
+  }
+  uint64_t h = 0;
+  for (uint32_t w = 0; w < t->nw; w++) h = kh_mix(h ^ s[w]);
+  uint32_t i = (uint32_t)h & (t->cap - 1);
+  while (t->ct[i] && !cm_eq(t->key + (size_t)i * t->nw, s, t->nw)) i = (i + 1) & (t->cap - 1);
+  if (!t->ct[i]) { cm_cpy(t->key + (size_t)i * t->nw, s, t->nw); t->n++; }
+  t->ct[i] += m;
+}
+
+// The call's confidence against EVERY other sample, not the runner-up alone. held[j] =
+// reads whose S(r) holds sample j; t = the call. For each other sample j, a = reads t holds and j does not,
+// b = the reverse, so s_t - s_j = (a - b) / |R+|:
+//   D    = min_j (a - b) / (a + b), the margin over the hardest competitor on the reads that tell the two
+//          apart: 0 = some sample is indistinguishable from the call, 1/2 = 3:1 for it, 1 = no sample holds
+//          a read the call does not;
+//   D_lo = the same with a / (a + b) at its 95% Wilson lower bound (few discriminating reads -> lower);
+//   pi   = each sample's share of the reads, by EM on the mixture P(r) = sum_{c in S(r)} pi_c.
+// Returns D; *jm = the hardest competitor (ns if none), *pi = the EM shares (ns entries), *it = EM iterations.
+static double call_conf(const sset_t *st, uint32_t ns, const uint32_t *held, uint32_t t,
+                        double *Dlo, uint32_t *jm, uint64_t ab[2], double *pi, uint32_t *it) {
+  uint64_t *both = calloc(ns ? ns : 1, sizeof(uint64_t));
+  size_t E = 0; uint32_t nk = 0;
+  for (uint32_t i = 0; i < st->cap; i++) if (st->ct[i]) {
+    const uint64_t *k = st->key + (size_t)i * st->nw; nk++; E += cm_pop(k, st->nw);
+    if (cm_get(k, t))
+      for (uint32_t w = 0; w < st->nw; w++)
+        for (uint64_t b = k[w]; b; b &= b - 1) both[(w << 6) + (uint32_t)__builtin_ctzll(b)] += st->ct[i];
+  }
+  double D = 2; *Dlo = 2; *jm = ns; ab[0] = ab[1] = 0;
+  for (uint32_t j = 0; j < ns; j++) {
+    if (j == t || !held[j]) continue;
+    uint64_t a = held[t] - both[j], b = held[j] - both[j];
+    double n = (double)(a + b), d = 0, lo = 0, z = 1.96;
+    if (n > 0) {
+      double p = (double)a / n;
+      d = ((double)a - (double)b) / n;
+      lo = 2 * (p + z * z / (2 * n) - z * sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / (1 + z * z / n) - 1;
+    }
+    if (d < D) { D = d; *jm = j; ab[0] = a; ab[1] = b; }
+    if (lo < *Dlo) *Dlo = lo;
+  }
+  if (*jm == ns) D = *Dlo = 1;                        // no other sample holds any read
+  // EM over the distinct sets, sparse: each iteration costs the summed set sizes, not sets x samples
+  size_t *off = malloc(((size_t)nk + 1) * sizeof(size_t));
+  uint32_t *ix = malloc((E ? E : 1) * sizeof(uint32_t)), np = 0, r = 0;
+  double *w = malloc((nk ? nk : 1) * sizeof(double)), *acc = malloc((ns ? ns : 1) * sizeof(double)), W = 0;
+  off[0] = 0;
+  for (uint32_t i = 0; i < st->cap; i++) if (st->ct[i]) {
+    const uint64_t *k = st->key + (size_t)i * st->nw; size_t o = off[r];
+    for (uint32_t q = 0; q < st->nw; q++)
+      for (uint64_t b = k[q]; b; b &= b - 1) ix[o++] = (q << 6) + (uint32_t)__builtin_ctzll(b);
+    w[r] = st->ct[i]; W += w[r]; off[++r] = o;
+  }
+  for (uint32_t j = 0; j < ns; j++) np += held[j] > 0;
+  for (uint32_t j = 0; j < ns; j++) pi[j] = held[j] ? 1.0 / np : 0;
+  for (*it = 1; *it <= 5000; (*it)++) {
+    memset(acc, 0, ns * sizeof(double));
+    for (uint32_t k = 0; k < nk; k++) {
+      double den = 0;
+      for (size_t o = off[k]; o < off[k + 1]; o++) den += pi[ix[o]];
+      for (size_t o = off[k]; o < off[k + 1]; o++) acc[ix[o]] += w[k] / den;
+    }
+    double dmax = 0;
+    for (uint32_t j = 0; j < ns; j++) {
+      double v = pi[j] * acc[j] / W;
+      if (fabs(v - pi[j]) > dmax) dmax = fabs(v - pi[j]);
+      pi[j] = v;
+    }
+    if (dmax < 1e-7) break;
+  }
+  if (*it > 5000) *it = 5000;
+  free(both); free(off); free(ix); free(w); free(acc);
+  return D;
+}
+
+// `topn`: ranks printed per set-call block; 0 = all, down to the first zero, so absence
+// from the list means exactly zero.
+// `tol` < 0 = not given: 1 (strict intersection) for a normal index, 0.9 for a
+// --fast-mask one. Below 1 a read's set is every colour present in at least
+// ceil(tol * hits) of its hit k-mers' masks (read off `votes`); at 1 it is the plain
+// intersection and the code path is the untouched one.
+//
+// --set-call mode replaces the intersection with the read's MOST-VOTED colours, ties
+// kept: the colours named by the most of its hits. Where the intersection is not
+// empty it is exactly that set (its colours have votes = hits), so mode only changes
+// the reads whose intersection one stray hit emptied -- 1,351 of 2,658 HiFi reads
+// on chr21 (HG002, 1x, full panel). It then ranks samples as [sample] does.
 static void run_classify(const pidx_t *ix, const char *reads, int setcall, int topn,
                          double tol, FILE *out) {
   if (tol < 0) tol = (ix->flags & PEX_F_FASTMASK) ? 0.9 : 1.0;
-  if (tol < 1.0)
+  int fm = setcall == SET_MODE;
+  if (fm) fprintf(stderr, "classify: --set-call mode, a read's set is its most-voted colours\n");
+  else if (tol < 1.0)
     fprintf(stderr, "classify: tolerant intersection --tol %.3g%s\n", tol,
             (ix->flags & PEX_F_FASTMASK) ? " (--fast-mask index)" : "");
   kh_t *km = ix->km;
@@ -2245,6 +2581,10 @@ static void run_classify(const pidx_t *ix, const char *reads, int setcall, int t
   uint32_t *slast     = calloc(ns ? ns : 1, sizeof(uint32_t));
   uint32_t *sshar     = calloc(ns ? ns : 1, sizeof(uint32_t));
   uint32_t *cpriv     = calloc(nc ? nc : 1, sizeof(uint32_t));
+  // Each read's sample set S(r), interned with its count, for the call's confidence (call_conf).
+  int sconf = setcall == SET_ALL || setcall == SET_SAMPLE || fm;
+  sset_t sst = { NULL, NULL, 0, 0, cm_nw(ns) };
+  uint64_t *sset = calloc(sst.nw, sizeof(uint64_t));
 
   gzFile fp = gzopen(reads, "r");
   if (!fp) { fprintf(stderr, "classify: cannot open %s\n", reads); return; }
@@ -2282,7 +2622,10 @@ static void run_classify(const pidx_t *ix, const char *reads, int setcall, int t
         if (votes[c] > v1) { v2 = v1; v1 = votes[c]; } \
         else if (votes[c] > v2) v2 = votes[c]; \
       if (v1) { nclass++; \
-        if (tol < 1.0) { \
+        if (fm) { \
+          memset(inter, 0, (size_t)nw * sizeof(uint64_t)); \
+          for (uint32_t c = 0; c < nc; c++) if (votes[c] == v1) cm_set(inter, c); } \
+        else if (tol < 1.0) { \
           double tx = tol * (double)hits; uint32_t thr = (uint32_t)tx; \
           if ((double)thr < tx - 1e-9) thr++;            /* ceil, without libm */ \
           memset(inter, 0, (size_t)nw * sizeof(uint64_t)); \
@@ -2309,7 +2652,8 @@ static void run_classify(const pidx_t *ix, const char *reads, int setcall, int t
         for (uint32_t sx = 0; sx < ns; sx++) \
           if (scnt[sx]) { scontains[sx]++; \
             if (scnt[sx] == 1) cpriv[slast[sx]]++; else sshar[sx]++; \
-            scnt[sx] = 0; } \
+            scnt[sx] = 0; if (sconf) cm_set(sset, sx); } \
+        if (sconf && cm_any(sset, sst.nw)) { sset_add(&sst, sset, 1); memset(sset, 0, sst.nw * sizeof(uint64_t)); } \
         if (ni == 1) nsig++; \
         fprintf(out, "%s\t%s\t%u\t%u\t%u\t%zu\t%zu\t%u\t%s\t%d\t%s\n", \
                 name, tie, ntie, v1, v2, hits, disc, \
@@ -2421,17 +2765,19 @@ static void run_classify(const pidx_t *ix, const char *reads, int setcall, int t
     }
     // Per SAMPLE: share of reads whose intersection contains ANY haplotype of the donor.
     // [fraction] ranks assemblies, this ranks individuals; neither replaces the other.
-    if (setcall == SET_ALL || setcall == SET_SAMPLE) {
+    if (setcall == SET_ALL || setcall == SET_SAMPLE || fm) {
       uint8_t *sshown = calloc(ns ? ns : 1, 1);
+      uint32_t call = ns;
       for (uint32_t rank = 0; rank < (topn ? (uint32_t)topn : ns); rank++) {
         uint32_t best = ns, bv = 0;
         for (uint32_t sx = 0; sx < ns; sx++)
           if (!sshown[sx] && scontains[sx] >= bv) { bv = scontains[sx]; best = sx; }
         if (best == ns || bv == 0) break;
         sshown[best] = 1;
+        if (!rank) call = best;
         uint32_t nh = 0;
         for (uint32_t c = 0; c < nc; c++) if (csamp[c] == best) nh++;
-        fprintf(stderr, "set-call[sample]    %-16.*s %.3f  (%u/%zu reads, %u haplotype%s)%s\n",
+        fprintf(stderr, "set-call[%s    %-16.*s %.3f  (%u/%zu reads, %u haplotype%s)%s\n", fm ? "mode]  " : "sample]",
                 (int)slen_[best], sname[best], (double)bv / (double)nclass,
                 bv, nclass, nh, nh == 1 ? "" : "s", rank ? "" : "   <- call");
         if (nh > 1) {                       // the private/shared split, per copy
@@ -2442,6 +2788,19 @@ static void run_classify(const pidx_t *ix, const char *reads, int setcall, int t
                       (double)cpriv[c] / (double)nclass);
           fprintf(stderr, "   shared %.3f\n", (double)sshar[best] / (double)nclass);
         }
+      }
+      if (call < ns) {
+        double Dlo, *pi = malloc(ns * sizeof(double)); uint32_t jm, it, p1 = call, p2 = ns; uint64_t ab[2];
+        double D = call_conf(&sst, ns, scontains, call, &Dlo, &jm, ab, pi, &it);
+        for (uint32_t sx = 0; sx < ns; sx++) if (pi[sx] > pi[p1]) p1 = sx;
+        for (uint32_t sx = 0; sx < ns; sx++) if (sx != p1 && (p2 == ns || pi[sx] > pi[p2])) p2 = sx;
+        fprintf(stderr, "set-call[conf]      D %.4f  D_lo %.4f  hardest %.*s (a %llu, b %llu)  pi %.4f"
+                        "  largest %.*s %.4f, %.*s %.4f  (EM %u iterations, %u read sets)\n",
+                D, Dlo, jm < ns ? (int)slen_[jm] : 1, jm < ns ? sname[jm] : "-",
+                (unsigned long long)ab[0], (unsigned long long)ab[1], pi[call],
+                (int)slen_[p1], sname[p1], pi[p1], p2 < ns ? (int)slen_[p2] : 1, p2 < ns ? sname[p2] : "-",
+                p2 < ns ? pi[p2] : 0.0, it, sst.n);
+        free(pi);
       }
       free(sshown);
     }
@@ -2465,7 +2824,7 @@ static void run_classify(const pidx_t *ix, const char *reads, int setcall, int t
     if (nc > 1) {
       uint32_t *nn = malloc(nc * sizeof(uint32_t));
       double *jc = malloc(nc * sizeof(double));
-      panel_nn(ix, nn, jc);
+      panel_nn(ix, nn, jc, NULL);
       uint32_t worst = 0;
       for (uint32_t c = 1; c < nc; c++) if (jc[c] > jc[worst]) worst = c;
       uint32_t best = nc, bv = 0;                      // the color just called
@@ -2481,7 +2840,7 @@ static void run_classify(const pidx_t *ix, const char *reads, int setcall, int t
     free(shown); free(sig); free(cov);
   }
   free(csamp); free((void *)sname); free(slen_); free(scontains);
-  free(scnt); free(slast); free(sshar); free(cpriv);
+  free(scnt); free(slast); free(sshar); free(cpriv); free(sst.key); free(sst.ct); free(sset);
   free(line); free(votes); free(contains); free(vtotal);
   free(all); free(ginter); free(inter); free(masks); free(seen); gzclose(fp);
 }
@@ -4725,6 +5084,31 @@ static void build_padj(bg_t *g) {
   free(cap);
 }
 
+// The `graph:` line of an --index build: segments and links as gfatools holds them
+// (a link and its reverse complement are one L-line; a hairpin v -> v^1 is its own),
+// and walked_edges = G_P's edges counted the same way, so it reads against links.
+// --full-graph has no G_P in memory, so it builds one just to count it.
+static void graph_line(const gfa_t *gfa, const bg_t *g, int full_graph) {
+  uint32_t nl = 0, ne = 0;
+  for (uint64_t i = 0; i < gfa->n_arc; i++) {
+    const gfa_arc_t *a = &gfa->arc[i];
+    if (!a->del && (!a->comp || a->w == (gfa_arc_head(*a) ^ 1))) nl++;
+  }
+  bg_t t = *g;
+  if (full_graph) build_padj(&t);
+  for (uint32_t v = 0; v < t.n; v++)
+    for (uint32_t i = 0; i < t.adjn[v]; i++) {
+      uint32_t w = t.adj[v][i], cv = w ^ 1, cw = v ^ 1;   // the complement arc cv -> cw
+      if ((cv < v || (cv == v && cw < w)) &&             // ...sorts first: counted there
+          bsearch(&cw, t.adj[cv], t.adjn[cv], sizeof(uint32_t), cmp_u32)) continue;
+      ne++;
+    }
+  if (full_graph) {
+    for (uint32_t v = 0; v < t.n; v++) free(t.adj[v]);
+    free(t.adj); free(t.adjn);
+  }
+  fprintf(stderr, "graph: segments=%u links=%u walked_edges=%u\n", gfa->n_seg, nl, ne);
+}
 
 // wl_t: the --colors whitelist, read once and matched against the color names
 // bg_build has already computed over the WHOLE graph.
@@ -6482,6 +6866,75 @@ int main(void) {
       pidx_free(one); pidx_free(h); pidx_free(q);
     }
 
+    // --max-colours and PEX6. Every mask here holds 36..64 of the NCOL colours, so a
+    // bound under 36 keeps nothing and NCOL keeps everything, and a kept record is
+    // never altered. Then a private-only index (one colour per record, ids taken from
+    // BOTH words, with and without positions) must survive PEX6 exactly, and be smaller
+    // than the mask file by exactly (8*nw - 2) bytes a record (less the 4-byte flags
+    // word a PEX3 header does not have).
+    {
+      pidx_t *f0 = pidx_build(&wb, wg, SEGLEN, KK, 0, 0, 0, 1, 0);
+      pidx_t *f1 = pidx_build(&wb, wg, SEGLEN, KK, 0, 0, 0, 1, 0);
+      pidx_t *f2 = pidx_build(&wb, wg, SEGLEN, KK, 0, 0, 0, 1, 0);
+      size_t n0 = ix->nkmer, n36 = 0;
+      for (size_t s2 = 0; s2 <= ix->km->mask; s2++)
+        if (ix->km->st[s2] == KH_IDX && cm_pop(ix->cmask + s2 * ix->nw, ix->nw) <= 36) n36++;
+      assert(pex_max_colours(f0, 35) == 0 && !(f0->flags & PEX_F_PRIVATE));
+      assert(pex_max_colours(f1, NCOL) == n0);
+      assert(pex_max_colours(f2, 36) == n36 && n36 > 0 && n36 < n0);
+      for (size_t s2 = 0; s2 <= f2->km->mask; s2++) {
+        if (f2->km->st[s2] != KH_IDX) continue;
+        size_t b2 = kh_slot(ix->km, f2->km->key[s2], 0);
+        assert(cm_eq(f2->cmask + s2 * f2->nw, ix->cmask + b2 * ix->nw, ix->nw));
+      }
+      pidx_free(f0); pidx_free(f1); pidx_free(f2);
+
+      for (int withpos = 0; withpos < 2; withpos++) {
+        pidx_t *p = pidx_build(&wb, wg, SEGLEN, KK, 0, 0, 0, 1, 0);
+        size_t odd = 0;
+        for (size_t s2 = 0; s2 <= p->km->mask; s2++) {
+          if (p->km->st[s2] != KH_IDX) continue;
+          uint64_t *m = p->cmask + s2 * p->nw;
+          uint32_t lo = NCOL, hi = 0;
+          for (uint32_t c = 0; c < NCOL; c++) if (cm_get(m, c)) { if (lo == NCOL) lo = c; hi = c; }
+          memset(m, 0, (size_t)p->nw * sizeof(uint64_t));
+          cm_set(m, (odd++ & 1) ? hi : lo);
+        }
+        p->flags |= PEX_F_PRIVATE;
+        if (withpos) {
+          p->blk = malloc((p->km->mask + 1) * sizeof(uint16_t));
+          for (size_t s2 = 0; s2 <= p->km->mask; s2++) p->blk[s2] = (uint16_t)(s2 % 1000);
+          p->blk_bp = 10000; p->blk_len = 123456789ULL; p->blk_ref = strdup("c0");
+        }
+        const char *t6 = "gpeb_pex6_selftest.tmp", *t3 = "gpeb_pex3_selftest.tmp";
+        assert(pex_write(t6, p, NULL) == 0);
+        pidx_t *q = pex_read(t6);
+        assert(q && (q->flags & PEX_F_PRIVATE) && !(q->flags & PEX_F_POS));
+        assert(q->nkmer == p->nkmer && q->nw == p->nw && q->nc == p->nc);
+        assert(withpos ? (q->blk && q->blk_bp == 10000 && q->blk_len == 123456789ULL) : !q->blk);
+        for (size_t s2 = 0; s2 <= p->km->mask; s2++) {
+          if (p->km->st[s2] != KH_IDX) continue;
+          size_t t = kh_slot(q->km, p->km->key[s2], 0);
+          assert(t != (size_t)-1 && q->km->st[t] == KH_IDX);
+          assert(cm_eq(q->cmask + t * q->nw, p->cmask + s2 * p->nw, p->nw));
+          assert(cm_pop(q->cmask + t * q->nw, q->nw) == 1);
+          if (withpos) assert(q->blk[t] == p->blk[s2]);
+        }
+        p->flags &= ~PEX_F_PRIVATE;                       // the same records, mask form
+        assert(pex_write(t3, p, NULL) == 0);
+        long z6 = 0, z3 = 0;
+        FILE *g6 = fopen(t6, "rb"), *g3 = fopen(t3, "rb");
+        assert(g6 && g3);
+        fseek(g6, 0, SEEK_END); z6 = ftell(g6); fseek(g3, 0, SEEK_END); z3 = ftell(g3);
+        fclose(g6); fclose(g3);
+        // PEX6 always carries the flags word, which a plain PEX3 header lacks (PEX5 has it)
+        assert(z3 - z6 == (long)(p->nkmer * (8 * p->nw - 2)) - (withpos ? 0 : 4));
+        printf("[ok] PEX6%s: %zu private records round-trip, %ld -> %ld bytes\n",
+               withpos ? " with positions" : "", p->nkmer, z3, z6);
+        pidx_free(p); pidx_free(q); remove(t6); remove(t3);
+      }
+    }
+
     int wide = 0;
     for (size_t s2 = 0; s2 <= ix->km->mask; s2++) {
       if (ix->km->st[s2] != KH_IDX) continue;
@@ -6521,7 +6974,7 @@ int main(void) {
     // giving 120/160 = 0.75, and every color below NCOL has such a neighbour.
     { uint32_t *nn = malloc(NCOL * sizeof(uint32_t));
       double *jc = malloc(NCOL * sizeof(double));
-      panel_nn(ix, nn, jc);
+      panel_nn(ix, nn, jc, NULL);
       for (uint32_t c = 0; c < NCOL; c++) {
         assert(fabs(jc[c] - 0.75) < 1e-9);              // one differing bubble
         assert(__builtin_popcount(c ^ nn[c]) == 1);     // ...and that is the neighbour
@@ -6640,6 +7093,21 @@ int main(void) {
       assert(st.unc_end == 0); }
     printf("[ok] cover_window: %ld random windows, gains exact and non-increasing, >= 1-1/e of the best 3 colours"
            " (optimal in %ld), stop and tie rules\n", ntest, optimal); }
+
+  // call_conf on conf.py's selftest: samples A, B, C; sets {A,B} x10, {A} x6, {B} x2, {C} x1. The call A holds 16,
+  // B 12: against B a = 6, b = 2, D = 1/2; against C 15/17. A sample holding exactly the call's reads gives D = 0.
+  { sset_t st = { NULL, NULL, 0, 0, 1 }; uint64_t s; uint32_t held[3] = {16, 12, 1}, jm, it; uint64_t ab[2]; double Dlo, pi[3];
+    s = 3; sset_add(&st, &s, 4); sset_add(&st, &s, 6); s = 1; sset_add(&st, &s, 6); s = 2; sset_add(&st, &s, 2); s = 4; sset_add(&st, &s, 1);
+    for (uint64_t x = 8; x < 8 + 3000; x++) { s = x; sset_add(&st, &s, 1); }  // forces growth; samples >= 3 are outside ns
+    assert(st.n == 4 + 3000);
+    sset_t st2 = { NULL, NULL, 0, 0, 1 }; s = 3; sset_add(&st2, &s, 10); s = 1; sset_add(&st2, &s, 6); s = 2; sset_add(&st2, &s, 2); s = 4; sset_add(&st2, &s, 1);
+    double D = call_conf(&st2, 3, held, 0, &Dlo, &jm, ab, pi, &it);
+    assert(D == 0.5 && jm == 1 && ab[0] == 6 && ab[1] == 2 && Dlo < D);
+    assert(fabs(pi[0] + pi[1] + pi[2] - 1) < 1e-6 && pi[0] > pi[1] && pi[1] > pi[2] && pi[2] > 0);
+    sset_t st3 = { NULL, NULL, 0, 0, 1 }; uint32_t h3[3] = {5, 5, 0}; s = 3; sset_add(&st3, &s, 5);
+    assert(call_conf(&st3, 3, h3, 0, &Dlo, &jm, ab, pi, &it) == 0.0 && jm == 1);
+    free(st.key); free(st.ct); free(st2.key); free(st2.ct); free(st3.key); free(st3.ct);
+    printf("[ok] call_conf: D = 1/2 against the hardest sample, 0 for an indistinguishable one; pi sums to 1, set table grows\n"); }
 
   // --set-call mosaic, end to end, on a world whose answer is known. A reference and
   // five haplotypes over 130 SNP sites, one every 60 bp. The donor is diploid: copy 1
@@ -6867,6 +7335,87 @@ int main(void) {
     pidx_free(ix); gpeb_free(gs); bg_free(bg); gfa_destroy(gfa);
   }
 
+  // --walk-dedup must leave the table exactly as the plain walk stream does -- every
+  // key's state, locus and mask -- on a graph built to stress what a context has to
+  // capture: segments shorter than k-1 (contexts of many vertices), deletions (two
+  // contexts per site), odd walks read backward, a haplotype cut into two walks
+  // (contexts at a walk start), an N, and copied segments (multi-locus keys).
+  { enum { NS = 80, NH = 10 };
+    unsigned rs = 777u;
+    #define RB4() ("ACGT"[(rs = rs * 1103515245u + 12345u) >> 24 & 3])
+    #define RU(n) (((rs = rs * 1103515245u + 12345u) >> 16) % (n))
+    const char *gp = "gpeb_dedup_selftest.gfa";
+    FILE *gf = fopen(gp, "w");
+    assert(gf);
+    fprintf(gf, "H\tVN:Z:1.1\n");
+    char bb[NS + 1][48];
+    for (int i = 0; i <= NS; i++) {
+      int L = 1 + (int)RU(45);
+      for (int j = 0; j < L; j++) bb[i][j] = RB4();
+      bb[i][L] = 0;
+    }
+    for (int i = 10; i <= NS; i += 17) strcpy(bb[i], bb[i - 7]);
+    if (strlen(bb[33]) > 2) bb[33][1] = 'N';
+    for (int i = 0; i <= NS; i++) fprintf(gf, "S\ts%d\t%s\n", i, bb[i]);
+    uint8_t del[NS], al[NH][NS];
+    for (int i = 0; i < NS; i++) {
+      char A[5], B[5]; int la = 1 + (int)RU(4), lb = 1 + (int)RU(4);
+      for (int j = 0; j < la; j++) A[j] = RB4();
+      A[la] = 0;
+      for (int j = 0; j < lb; j++) B[j] = RB4();
+      B[lb] = 0;
+      if (!strcmp(A, B)) B[0] = A[0] == 'A' ? 'C' : 'A';
+      del[i] = RU(3) == 0;
+      fprintf(gf, "S\ta%d\t%s\nS\tb%d\t%s\n", i, A, i, B);
+      fprintf(gf, "L\ts%d\t+\ta%d\t+\t0M\nL\ts%d\t+\tb%d\t+\t0M\n"
+                  "L\ta%d\t+\ts%d\t+\t0M\nL\tb%d\t+\ts%d\t+\t0M\n", i, i, i, i, i, i + 1, i, i + 1);
+      if (del[i]) fprintf(gf, "L\ts%d\t+\ts%d\t+\t0M\n", i, i + 1);
+    }
+    for (int h = 0; h < NH; h++) for (int i = 0; i < NS; i++) al[h][i] = (uint8_t)RU(del[i] ? 3 : 2);
+    for (int h = 0; h < NH; h++) {
+      char stp[2 * NS + 2][8]; int ns = 0;
+      snprintf(stp[ns++], 8, "s0");
+      for (int i = 0; i < NS; i++) {
+        if (al[h][i] < 2) snprintf(stp[ns++], 8, "%c%d", al[h][i] ? 'b' : 'a', i);
+        snprintf(stp[ns++], 8, "s%d", i + 1);
+      }
+      for (int part = 0; part < (h ? 1 : 2); part++) {         // H0: two walks, cut mid-way
+        int a0 = h ? 0 : part * (ns / 2), a1 = h ? ns : (part ? ns : ns / 2);
+        fprintf(gf, "W\tH%d\t1\tc%d\t0\t0\t", h, part);
+        if (h & 1) for (int x = a1 - 1; x >= a0; x--) fprintf(gf, "<%s", stp[x]);
+        else for (int x = a0; x < a1; x++) fprintf(gf, ">%s", stp[x]);
+        fprintf(gf, "\n");
+      }
+    }
+    fclose(gf);
+    #undef RB4
+    #undef RU
+    gfa_t *gfa = gfa_read(gp);
+    assert(gfa && gfa->n_walk == NH + 1);
+    bg_t *bg = bg_build(gfa, 1, 0, 0, NULL);
+    gset_t *gs = gpeb(bg, 1, GSPAN, GSPAN, 0.0, 0, 0);
+    size_t nmany = 0, nidx = 0;
+    for (uint32_t sk = 0; sk <= 8; sk += 8) for (int nt = 1; nt <= 4; nt *= 4) {
+      walk_dedup = 0; pidx_t *p0 = pidx_build(bg, gs, GSPAN, 21, 0, 0, 0, nt, sk);
+      walk_dedup = 1; pidx_t *p1 = pidx_build(bg, gs, GSPAN, 21, 0, 0, 0, nt, sk);
+      walk_dedup = 0;
+      assert(p0 && p1 && p0->km->mask == p1->km->mask && p0->nkmer == p1->nkmer && p0->nw == p1->nw);
+      for (size_t s2 = 0; s2 <= p0->km->mask; s2++) {
+        assert(p0->km->st[s2] == p1->km->st[s2]);
+        if (p0->km->st[s2] == KH_EMPTY) continue;
+        assert(p0->km->key[s2] == p1->km->key[s2]);
+        if (p0->km->st[s2] == KH_IDX || p0->km->st[s2] == KH_ONE) assert(p0->km->loc[s2] == p1->km->loc[s2]);
+        assert(cm_eq(p0->cmask + s2 * p0->nw, p1->cmask + s2 * p1->nw, p0->nw));
+        nmany += p0->km->st[s2] == KH_MANY; nidx += p0->km->st[s2] == KH_IDX;
+      }
+      pidx_free(p0); pidx_free(p1);
+    }
+    assert(nmany > 0 && nidx > 0);
+    printf("[ok] --walk-dedup == plain walk stream: same states, loci and masks"
+           " (%zu indexed, %zu multi-locus keys over 4 builds)\n", nidx, nmany);
+    gpeb_free(gs); bg_free(bg); gfa_destroy(gfa); remove(gp);
+  }
+
   // --mosaic-temper: the median, chat and w by hand. Even and odd counts (blocks without
   // data ignored), w capped at 1, no data at all, the share block tempering scales down.
   { mobs_t T; memset(&T, 0, sizeof T);
@@ -6918,9 +7467,10 @@ static void usage(const char *prog, FILE *out) {
 "index and classify:\n"
 "  --index K OUT.pex    build the junction k-mer index, write it, stop\n"
 "  --classify K READS   color FASTA/FASTQ reads (plain/.gz); per-read TSV on stdout\n"
-"  --use-index F.pex    classify (or --subsample) against a saved index; pass the\n"
+"  --use-index F.pex    classify (or --subsample, --max-colours) against a saved index; pass the\n"
 "                       GFA too to refuse a stale one\n"
-"  --syncmer S          index only closed syncmers at s-mer length S (0 = off)\n"
+"  --syncmer S          index only closed syncmers at s-mer length S (default 16; 0 = every\n"
+"                       k-mer, needed for k <= 16)\n"
 "  --keep-ambiguous     also index k-mers found at several loci (all classes)\n"
 "  --keep-many LIST     also index the KH_MANY k-mers of these locus classes, e.g.\n"
 "                       segment,sibling,highcopy (strand, segment, sibling, distant,\n"
@@ -6932,11 +7482,20 @@ static void usage(const char *prog, FILE *out) {
 "                       it (default 1 = strict intersection; 0.9 for --fast-mask)\n"
 "  --index-all          ABLATION: index every walk k-mer, not only junction ones\n"
 "  --threads N          threads for the index build's streaming passes (default 1)\n"
+"  --walk-dedup         PROTOTYPE: stream each distinct junction context once instead of\n"
+"                       every walk; same index, fewer bases read\n"
 "  --set-call MODE      whole-set call: all (default), fraction, intersect, vote,\n"
-"                       sample, mosaic, cover\n"
+"                       sample, mode, mosaic, cover; mode = sample with a read's set\n"
+"                       its most-voted colours (ties kept), not the intersection\n"
 "  --top N              ranks printed per set-call block (default 5, 0 = all)\n"
 "  --subsample R OUT    with --use-index: keep a seeded, nested fraction R, stop\n"
 "  --subsample-seed N   another --subsample draw\n"
+"  --panel-jaccard OUT  with --use-index: TSV of every colour pair's shared k-mers and\n"
+"                       Jaccard (a b n_a n_b shared jaccard), write OUT, stop\n"
+"  --max-colours N OUT  with --use-index: keep only the k-mers held by at most N colours\n"
+"                       (rare ones), write OUT, stop; N=1 = the private k-mers, stored\n"
+"                       as a 2-byte colour id per record (PEX6) instead of the mask.\n"
+"                       Private means within THIS index's colours (a --split-colors group)\n"
 "\n"
 "mosaic: two haplotype tracks that recombine along the chromosome, fitted to a read set\n"
 "  --mosaic-ref COLOUR  with --index: store a block id per record, projected on COLOUR's\n"
@@ -6985,7 +7544,7 @@ static void usage(const char *prog, FILE *out) {
 "                       windows of whole blocks that each hold --cover-hits hits)\n"
 "  --cover-hits N       the hits an automatic window holds, at least (default 4000)\n"
 "  --cover-max N        most colours per window (default 32)\n"
-"  --cover-min-frac F   add a colour only while it covers >= F of the window's hits (default 0.0005)\n"
+"  --cover-min-frac F   add a colour only while it covers >= F of the window's hits (default 0.0001)\n"
 "  --cover-min-gain G   ...and at least G hits (default 2)\n"
 "  --cover-stray R      drop hits farther than R blocks from their read's median (5 HiFi, 2 short)\n"
 "  --cover-rule R       greedy (default) | support: CONTROL, the N colours with most hits each\n"
@@ -7005,7 +7564,7 @@ static void usage(const char *prog, FILE *out) {
 "  --pebble-ambiguity K candidate k-mers proposed by several windows, and whether\n"
 "                       the window-derived mask matches the walk-derived one\n"
 "  -h, --help           this help\n",
-    prog, (unsigned)GSPAN, (unsigned)GSPAN);
+    prog, (unsigned)GMINGAP, (unsigned)GSPAN);
 }
 
 #define MAX_SPAN    100000       // --span cap: a window is 2*span bp, held per pebble
@@ -7164,8 +7723,10 @@ int main(int argc, char **argv) {
   int acyclic = 0; uint32_t kstats = 0, pamb = 0;
   uint32_t ck = 0; const char *creads = NULL; int fast_mask = 0; uint32_t keep_many = 0;  // --classify
   int all_kmers = 0;                                              // --index-all
-  uint32_t syncs = 0;                                             // --syncmer S
+  uint32_t syncs = 16; int syncs_set = 0;                         // --syncmer S
   const char *subout = NULL; double subrate = 0.0;                // --subsample
+  const char *maxout = NULL; uint32_t maxcol = 0;                 // --max-colours
+  const char *pjout = NULL;                                       // --panel-jaccard
   uint64_t subseed = 0x5bf03635d9e2a1c7ULL;                       // --subsample-seed
   int setcall = SET_ALL;                                          // --set-call
   const char *mref = NULL; uint32_t mblock = 10000;               // --mosaic-ref/-block
@@ -7173,7 +7734,7 @@ int main(int argc, char **argv) {
   const char *mkgfai = NULL;                                      // --make-gfai COLOUR
   mosaic_opt_t mo; memset(&mo, 0, sizeof mo);                     // --set-call mosaic
   mo.lambda = mo.rho = mo.eps = -1; mo.reads = MR_AUTO;
-  mo.cwin = 200000; mo.cauto = 0; mo.chits = 4000; mo.cmax = 32; mo.cfrac = 0.0005; mo.cgain = 2; mo.cstray = -1;   // --set-call cover
+  mo.cwin = 200000; mo.cauto = 0; mo.chits = 4000; mo.cmax = 32; mo.cfrac = 0.0001; mo.cgain = 2; mo.cstray = -1;   // --set-call cover
   int cover_opt = 0;                                              // a --cover-* option was given
   int topn = 5;                                                   // --top
   double tol = -1;                          // --tol; <0 = per-index default
@@ -7181,7 +7742,7 @@ int main(int argc, char **argv) {
   const char *frompeb = NULL;                                     // --from-peb
   int nthreads = 1;                                               // --threads
   int skip_stale = 0;                                             // --skip-stale-check
-  uint32_t min_gap = GSPAN;                  // default: no overlapping span windows
+  uint32_t min_gap = GMINGAP;                // --min-gap
   uint32_t span = GSPAN;                     // flank bp each side (--span)
   double min_complexity = 0.0;              // default: no low-complexity filter
   for (int i = 1; i < argc; i++) {
@@ -7230,11 +7791,16 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--fast-mask")) fast_mask = 1;
     else if (!strcmp(argv[i], "--index-all")) all_kmers = 1;
     else if (!strcmp(argv[i], "--syncmer"))
-      syncs = (uint32_t)strtoul(optval(argc, argv, &i, "--syncmer"), NULL, 10);
+      { syncs = (uint32_t)strtoul(optval(argc, argv, &i, "--syncmer"), NULL, 10); syncs_set = 1; }
     else if (!strcmp(argv[i], "--subsample")) {
       subrate = strtod(optval(argc, argv, &i, "--subsample"), NULL);
       subout = optval(argc, argv, &i, "--subsample");
     }
+    else if (!strcmp(argv[i], "--max-colours") || !strcmp(argv[i], "--max-colors")) {
+      maxcol = (uint32_t)strtoul(optval(argc, argv, &i, "--max-colours"), NULL, 10);
+      maxout = optval(argc, argv, &i, "--max-colours");
+    }
+    else if (!strcmp(argv[i], "--panel-jaccard")) pjout = optval(argc, argv, &i, "--panel-jaccard");
     else if (!strcmp(argv[i], "--tol")) {
       tol = strtod(optval(argc, argv, &i, "--tol"), NULL);
       if (!(tol > 0 && tol <= 1)) { fprintf(stderr, "--tol must be in (0, 1]\n"); return 1; }
@@ -7256,6 +7822,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--skip-stale-check")) skip_stale = 1;
     else if (!strcmp(argv[i], "--threads"))
       nthreads = (int)optuint(argc, argv, &i, "--threads", 1, MAX_THREADS);
+    else if (!strcmp(argv[i], "--walk-dedup")) walk_dedup = 1;   // prototype: same index, fewer bases streamed
     else if (!strcmp(argv[i], "--set-call")) {
       const char *m = optval(argc, argv, &i, "--set-call");
       if      (!strcmp(m, "all"))       setcall = SET_ALL;
@@ -7263,9 +7830,10 @@ int main(int argc, char **argv) {
       else if (!strcmp(m, "intersect")) setcall = SET_INTERSECT;
       else if (!strcmp(m, "vote"))      setcall = SET_VOTE;
       else if (!strcmp(m, "sample"))    setcall = SET_SAMPLE;
+      else if (!strcmp(m, "mode"))      setcall = SET_MODE;
       else if (!strcmp(m, "mosaic"))    setcall = SET_MOSAIC;
       else if (!strcmp(m, "cover"))     setcall = SET_COVER;
-      else { fprintf(stderr, "--set-call: all|fraction|intersect|vote|sample|mosaic|cover\n"); return 1; }
+      else { fprintf(stderr, "--set-call: all|fraction|intersect|vote|sample|mode|mosaic|cover\n"); return 1; }
     }
     else if (!strcmp(argv[i], "--mosaic-ref")) mref = optval(argc, argv, &i, "--mosaic-ref");
     else if (!strcmp(argv[i], "--mosaic-block"))
@@ -7387,14 +7955,21 @@ int main(int argc, char **argv) {
   if (cover_opt && setcall != SET_COVER) {
     fprintf(stderr, "the --cover-* options belong to --set-call cover\n"); return 1;
   }
+  if (setcall == SET_MODE && tol >= 0) {
+    fprintf(stderr, "--set-call mode and --tol both choose a read's set; give one\n"); return 1;
+  }
   if (mo.gfa_out && !(in && (usepex || mref))) {
     fprintf(stderr, "--mosaic-gfa needs the GFA the index was built from, as input\n"); return 1;
   }
   // Classifying from a prebuilt .pex skips the graph entirely -- that is the point
   // of the cache, so no GFA is required (or read) on this path.
+  if (maxout && !usepex) { fprintf(stderr, "--max-colours needs --use-index\n"); return 1; }
+  if (pjout && !usepex) { fprintf(stderr, "--panel-jaccard needs --use-index\n"); return 1; }
+  if (maxout && maxcol < 1) { fprintf(stderr, "--max-colours: N must be >= 1\n"); return 1; }
+  if (maxout && subout) { fprintf(stderr, "--max-colours and --subsample each write their own index; pick one\n"); return 1; }
   if (usepex) {
-    if (!creads && !subout && !mscore) {
-      fprintf(stderr, "--use-index needs --classify, --subsample or --mosaic-score\n"); return 1;
+    if (!creads && !subout && !maxout && !mscore && !pjout) {
+      fprintf(stderr, "--use-index needs --classify, --subsample, --max-colours, --panel-jaccard or --mosaic-score\n"); return 1;
     }
     if (subout && !(subrate > 0.0)) {
       fprintf(stderr, "--subsample: rate must be > 0 (got %g)\n", subrate); return 1;
@@ -7404,7 +7979,7 @@ int main(int argc, char **argv) {
     if (ck && ck != ix->k)
       fprintf(stderr, "note: --classify k=%u ignored, the index was built with k=%u\n",
               ck, ix->k);
-    if (syncs && syncs != ix->sk)
+    if (syncs_set && syncs != ix->sk)
       fprintf(stderr, "note: --syncmer %u ignored, the index was built with s=%u"
                       " (the filter is baked into which k-mers it holds)\n",
               syncs, ix->sk);
@@ -7433,11 +8008,27 @@ int main(int argc, char **argv) {
     } else {
       fprintf(stderr, "pex: staleness not checked (pass the GFA to verify it)\n");
     }
+    if (pjout) {                            // every colour pair's Jaccard, then stop
+      FILE *f = fopen(pjout, "w");
+      if (!f) { fprintf(stderr, "--panel-jaccard: cannot write %s\n", pjout); pidx_free(ix); return 1; }
+      uint32_t *nn = malloc((ix->nc ? ix->nc : 1) * sizeof(uint32_t));
+      double *jc = malloc((ix->nc ? ix->nc : 1) * sizeof(double));
+      panel_nn(ix, nn, jc, f);
+      int rcj = fclose(f) ? 1 : 0;
+      free(nn); free(jc); pidx_free(ix);
+      return rcj;
+    }
     // After the staleness check on purpose: thinning a stale index would just
     // produce a second stale index, with the mismatch one step further from view.
     if (subout) {
       pex_subsample(ix, subrate, subseed);
       int rcs = pex_write(subout, ix, NULL) ? 1 : 0;   // NULL: inherit the source
+      pidx_free(ix);
+      return rcs;
+    }
+    if (maxout) {
+      pex_max_colours(ix, maxcol);
+      int rcs = pex_write(maxout, ix, NULL) ? 1 : 0;   // NULL: inherit the source
       pidx_free(ix);
       return rcs;
     }
@@ -7491,6 +8082,7 @@ int main(int argc, char **argv) {
   wl_free(wl);
   if (!g) { gfa_destroy(gfa); return 1; }
   double t_bg = now_s() - t_p; t_p = now_s();
+  if (mkindex) graph_line(gfa, g, full_graph);
   gset_t *gs = frompeb ? peb_read(frompeb, g)
                        : gpeb(g, fast, min_gap, span, min_complexity, early,
                               acyclic);
