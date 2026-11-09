@@ -1,0 +1,17 @@
+# RECOMB 2027: every result of the paper, on the HPRC release 2.1 graphs and GIAB reads (README.md). From this directory:
+#   snakemake [all | index_study | calls | whole_genome | personalize] --profile profiles/local
+#   snakemake [target] --profile profiles/slurm --configfile config/config.yaml config/fir.yaml   (targets first: --configfile takes several files)
+# Every table lands in <workdir>/results/; scripts/tex_numbers.py prints from it the numbers of the text and tables.
+configfile: "config/config.yaml"
+
+include: "rules/common.smk"
+include: "rules/index.smk"
+include: "rules/calls.smk"
+include: "rules/wholegenome.smk"
+include: "rules/personalize.smk"
+
+rule all:
+    default_target: True
+    input: rules.index_study.output, rules.calls.output, rules.whole_genome.output, rules.personalize.output
+
+include: "rules/slurm.smk"     # keep last: it reads every rule's resources

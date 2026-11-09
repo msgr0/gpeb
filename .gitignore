@@ -21,3 +21,8 @@
 *.path.tsv
 *.sets.tsv
 gpeb_*selftest*
+
+# snakemake
+.snakemake/
+workflows/recomb27/work/
+workflows/recomb27/smoke/

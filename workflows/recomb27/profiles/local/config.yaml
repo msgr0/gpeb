@@ -1,0 +1,9 @@
+# One machine (the paper: pasteur, 64 cores, 251 GB):  snakemake [target] --profile profiles/local
+# Rules declare mem_gb; their sum is capped by resources. net caps the concurrent streams from NCBI (it refuses many at once).
+# rerun-triggers mtime: editing a rule or a script never re-runs finished jobs (the pruned panels, the indexes); newer inputs do.
+cores: 64
+resources: [mem_gb=230, net=3]
+keep-going: true
+rerun-incomplete: true
+rerun-triggers: mtime
+printshellcmds: true

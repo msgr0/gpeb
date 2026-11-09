@@ -1,0 +1,6 @@
+# pasteur (64 cores, 251 GB), where the paper ran, on top of config/config.yaml:
+#   snakemake [target] --profile profiles/local --configfile config/config.yaml config/pasteur.yaml
+workdir: /data/tmp/sgro_recomb27/v4
+gfa_dir: /data/tmp/peb-102026/hprc2/cache
+vg: /data/bin/vg-1.78.0
+kmc: /data/conda/sgro/envs/kmc/bin/kmc

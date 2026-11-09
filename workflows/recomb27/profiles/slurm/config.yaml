@@ -1,0 +1,24 @@
+# Alliance clusters (Fir, Narval), every rule its own Slurm job (snakemake-executor-plugin-slurm):
+#   snakemake [target] --profile profiles/slurm --configfile config/config.yaml config/fir.yaml
+# Run the controller in a login shell (bash -lc): the plugin needs sacctmgr on PATH. Each job asks for the rule's threads and mem_gb
+# (rules/slurm.smk copies it to mem_mb and picks the partition). runtime needs a unit: Snakemake 9 reads a bare number as seconds.
+executor: slurm
+jobs: 40
+latency-wait: 120                  # Lustre
+keep-going: true
+rerun-incomplete: true
+rerun-triggers: mtime
+default-resources:
+  - slurm_account=def-chauvec_cpu
+  - runtime=179m
+  - net=1
+set-resources:
+  g_dist: {runtime: "720m"}        # chr22's cover with 32 colors needed 3-4.5 h
+  giraffe: {runtime: "480m"}
+  g_minzip: {runtime: "360m"}
+  vg_hapl: {runtime: "600m"}
+  vg_dist: {runtime: "360m"}
+  build_index: {runtime: "360m"}
+  rank_call: {runtime: "720m"}     # syncmer 0 indexes: chr2 calls ran > 2 h
+  wg_merge: {runtime: "180m"}
+  wg_sup: {runtime: "600m"}        # one raw file streamed from NCBI

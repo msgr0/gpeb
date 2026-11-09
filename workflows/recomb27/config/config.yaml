@@ -1,0 +1,91 @@
+# RECOMB 2027 configuration. The paths are generic: config/pasteur.yaml, config/fir.yaml and config/narval.yaml set those of the
+# machines the paper ran on (snakemake [target] ... --configfile config/config.yaml config/<site>.yaml).
+workdir: work                   # every intermediate file and results/ (the paper: 1.4 TB per-chromosome, ~200 GB whole-genome)
+chroms: [chr21, chr22, chr16, chr9, chr19, chr3, chr1, chr2, chr8, chr6]   # sizes and structure: chr22, chr2, chr19, chr8 have the largest snarls, chr6 the MHC
+samples: [HG002, HG003, HG004, HG005]
+expect: {HG002: HG002, HG003: HG002, HG004: HG002, HG005: HG005}   # the sample a read set should call: the parents' reads call their child
+covs: ["0.5", "1", "2", "5", "10", "30"]                           # the per-chromosome ladder (strings: they are file names)
+
+# ---- tools ----------------------------------------------------------------------------------------------------------------------
+gpeb_commit: HEAD               # gpeb and pex_rare are built from this commit of the repository (bin/COMMIT records it)
+vg: ""                          # empty: the release vg_version is downloaded into workdir/bin
+vg_version: v1.78.0
+kmc: ""                         # empty: kmc on PATH (environment.yaml)
+time_bin: /usr/bin/time         # GNU time
+
+# ---- data -----------------------------------------------------------------------------------------------------------------------
+gfa_dir: gfa                    # HPRC release 2.1 Minigraph-Cactus GRCh38, one GFA per chromosome (<chrom>.gfa)
+panels:                         # graph name: samples removed from the GFA (prune_gfa.py; empty = the GFA itself)
+  full: []
+  noHG002: [HG002]
+refs: CHM13,GRCh38              # kept whole in every personalized graph (gpeb --mosaic-keep, vg --include-reference)
+giab_base: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data
+hifi_bam:                       # PacBio HiFi aligned to CHM13v2.0, sliced per chromosome with samtools (no full download)
+  HG002: AshkenazimTrio/HG002_NA24385_son/PacBio_HiFi-Revio_20231031/HG002_PacBio-HiFi-Revio_20231031_48x_CHM13v2.0.bam
+  HG003: AshkenazimTrio/HG003_NA24149_father/PacBio_HiFi-Revio_20231031/HG003_PacBio-HiFi-Revio_20231031_46x_CHM13v2.0.bam
+  HG004: AshkenazimTrio/HG004_NA24143_mother/PacBio_HiFi-Revio_20231031/HG004_PacBio-HiFi-Revio_20231031_36x_CHM13v2.0.bam
+  HG005: ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/CHM13v2.0/GIAB_5mC_CpG/HG005.chm13.deepvariant.haplotagged.bam
+sr_bam:                         # Element AVITI 2x150, long insert, 32-38x, aligned to GRCh38 (GIABv3)
+  HG002: AshkenazimTrio/HG002_NA24385_son/Element_AVITI_20240920/HG002_Element-LngInsert_34x_GRCh38-GIABv3.bam
+  HG003: AshkenazimTrio/HG003_NA24149_father/Element_AVITI_20240920/HG003_Element-LngInsert_32x_GRCh38-GIABv3.bam
+  HG004: AshkenazimTrio/HG004_NA24143_mother/Element_AVITI_20240920/HG004_Element-LngInsert_38x_GRCh38-GIABv3.bam
+  HG005: ChineseTrio/HG005_NA24631_son/Element_AVITI_20240920/HG005_Element-LngInsert_35x_GRCh38-GIABv3.bam
+
+# ---- the pebble index and the calls -------------------------------------------------------------------------------------------
+index: {k: 31, min_gap: 60, syncmer: 16, mosaic_ref: GRCh38}   # the default index (the cover needs GRCh38 positions)
+cover_window: 200000
+call_cover_max: 32
+cover_min_frac: 0.0001
+
+# ---- index study (rules/index.smk): one parameter at a time around the default, on the full graph --------------------------------
+exp1:
+  min_gaps: [0, 30, 150, 500, 1000, 2000]     # at syncmer 16
+  syncmers: [0, 12, 20, 24]                   # at min-gap 60
+  max_colours: [1, 10]                        # indexes cut from the default one
+  min_fracs: ["0", "0.0001", "0.0005", "0.001", "0.005"]   # --cover-min-frac of the cover call, on the default index
+  call_covs: ["1", "10"]
+
+# ---- whole genome (rules/wholegenome.smk) -------------------------------------------------------------------------------------
+wg_chroms: [chr1, chr2, chr3, chr4, chr5, chr6, chr7, chr8, chr9, chr10, chr11, chr12, chr13, chr14, chr15, chr16, chr17, chr18, chr19, chr20, chr21, chr22, chrX]
+wg_covs: ["0.5", "1", "2", "5"]  # whole-genome depth: bases / CHM13v2.0 length
+wg_umax: 0.2                     # the first pass keeps u < 0.2: rungs up to 5x need a depth of 25x
+wg_min_hits: [1, 5]
+wg_base: ""                      # where wg_ubam and wg_fastq live; empty: giab_base (NCBI)              # genome-wide calls on every read, and on the reads with >= 5 hits on their chromosome
+wg_ubam:                         # the raw PacBio files: two Revio cells each for HG002-4, seven Sequel II cells for HG005
+  HG002: [AshkenazimTrio/HG002_NA24385_son/PacBio_HiFi-Revio_20231031/HG002_PacBio-Revio_m84039_230928_213653_s3.hifi_reads.bam,
+          AshkenazimTrio/HG002_NA24385_son/PacBio_HiFi-Revio_20231031/HG002_PacBio-Revio_m84039_231005_222902_s1.hifi_reads.bam]
+  HG003: [AshkenazimTrio/HG003_NA24149_father/PacBio_HiFi-Revio_20231031/HG003_PacBio-Revio_m84039_230928_220759_s4.hifi_reads.bam,
+          AshkenazimTrio/HG003_NA24149_father/PacBio_HiFi-Revio_20231031/HG003_PacBio-Revio_m84039_231006_220627_s2.hifi_reads.bam]
+  HG004: [AshkenazimTrio/HG004_NA24143_mother/PacBio_HiFi-Revio_20231031/HG004_PacBio-Revio_m84039_230929_004333_s1.hifi_reads.bam,
+          AshkenazimTrio/HG004_NA24143_mother/PacBio_HiFi-Revio_20231031/HG004_PacBio-Revio_m84039_231006_223645_s3.hifi_reads.bam]
+  HG005: [ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/uBAMs/m64017_200723_190224.hifi_reads.bam,
+          ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/uBAMs/m64017_200730_190124.hifi_reads.bam,
+          ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/uBAMs/m64017_200801_011415.hifi_reads.bam,
+          ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/uBAMs/m64017_200802_073944.hifi_reads.bam,
+          ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/uBAMs/m64109_200304_195708.hifi_reads.bam,
+          ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/uBAMs/m64109_200309_192110.hifi_reads.bam,
+          ChineseTrio/HG005_NA24631_son/PacBio_CCS_15kb_20kb_chemistry2/uBAMs/m64109_200311_013444.hifi_reads.bam]
+wg_fastq:                        # the raw Element FASTQs: <prefix>_R1.fastq.gz and _R2 (345 GB in all, streamed)
+  HG002: AshkenazimTrio/HG002_NA24385_son/Element_AVITI_20240920/HG002_LngInsert_Fastqs/NIST_HG002_long-insert
+  HG003: AshkenazimTrio/HG003_NA24149_father/Element_AVITI_20240920/HG003_LngInsert_Fastqs/NIST_HG003_long-insert
+  HG004: AshkenazimTrio/HG004_NA24143_mother/Element_AVITI_20240920/HG004_LngInsert_Fastqs/NIST_HG004_long-insert
+  HG005: ChineseTrio/HG005_NA24631_son/Element_AVITI_20240920/HG005_LngInsert_Fastqs/NIST_HG005_long-insert
+
+# ---- personalized graphs (rules/personalize.smk), on noHG002 from HG002's HiFi reads ---------------------------------------------
+cover_caps: [2, 4, 8, 16, 32]    # gpeb cover: at most N colors per window
+vg_cfgs: [d32, s2, s4, s8, s16, s32]   # vg haplotypes: d32 = --preset diploid (the best pair of 32 candidates), sN = N haplotypes
+kmc_ci: [1]                      # kmc -ci1: the strongest vg haplotypes at 0.5-1x HiFi (-ci2 strips most k-mers)
+random_ns: [2, 4, 8, 16, 32]
+random_seeds: [1]
+
+# ---- threads and memory (GB; measured peaks plus headroom) ------------------------------------------------------------------------
+threads_build: 16
+threads_query: 4
+threads_vg: 16
+threads_map: 16
+mem_gb_build: {chr1: 72, chr2: 77, chr3: 62, chr4: 56, chr5: 56, chr6: 55, chr7: 52, chr8: 50, chr9: 43, chr10: 44, chr11: 42, chr12: 40,
+               chr13: 32, chr14: 30, chr15: 29, chr16: 32, chr17: 26, chr18: 25, chr19: 22, chr20: 21, chr21: 14, chr22: 16, chrX: 28}   # the default build: 1.3x its measured peak (Table 3); min-gap 0 and syncmer 0 get twice
+mem_gb_vgpanel: {chr21: 60, chr22: 140, chr16: 150, chr9: 48, chr3: 60, chr1: 80, chr19: 40, chr2: 220, chr8: 60, chr6: 50}   # vg index -j on the panel (chr2 measured 170, chr22 142); gbz, ri and hapl get half
+mem_gb_gdist: {chr22.gpeb.cover32: 512, chr22.gpeb.cover16: 60, chr2.gpeb.cover32: 150, chr2.gpeb.cover16: 60}   # chr22's cover with 32 colors tabulates snarls of up to 50k vertices: 449 GiB measured
+mem_gb_minzip: {chr1: 40, chr2: 56, fullpanel: 24, chr3.fullpanel: 32, chr1.fullpanel: 40, chr2.fullpanel: 48, chr22.gpeb.cover32: 60, chr8.fullpanel: 36, chr6.fullpanel: 36}
+mem_gb_giraffe: {chr2: 64, fullpanel: 40, chr1.fullpanel: 230, chr22.fullpanel: 90, chr2.fullpanel: 100, chr22.gpeb.cover32: 80, chr8.fullpanel: 100, chr6.fullpanel: 100}   # giraffe holds the distance index in memory

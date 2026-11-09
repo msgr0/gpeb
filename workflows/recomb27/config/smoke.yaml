@@ -1,0 +1,10 @@
+# A quick run of the per-chromosome rules on chr21 (README.md): one sweep setting, HG002 and HG003, two coverages, N = 4.
+#   snakemake calls index_study personalize --profile profiles/local --configfile config/config.yaml [config/<site>.yaml] config/smoke.yaml
+workdir: smoke
+chroms: [chr21]
+samples: [HG002, HG003]
+covs: ["0.5", "1"]
+exp1: {min_gaps: [500], syncmers: [], max_colours: [10], min_fracs: ["0"], call_covs: ["1"]}
+cover_caps: [4]
+vg_cfgs: [s4]
+random_ns: [4]
