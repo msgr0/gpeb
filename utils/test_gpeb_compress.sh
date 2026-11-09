@@ -8,7 +8,7 @@
 # pebbled), but the two windows differ. An edge-only key would collapse them into
 # one record and silently drop one window; edge+seq must keep them separate.
 set -eu
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."   # the repository root: make gpeb builds ./gpeb there
 make gpeb >/dev/null
 [ -x ./gpeb ] || { echo "FAIL: gpeb did not build"; exit 1; }
 
