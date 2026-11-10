@@ -1,17 +1,17 @@
 # RECOMB 2027 workflow
 
-This workflow reproduces every result of the paper *Colored Pebbling for Topology-Aware Indexing and Personalization of Pangenome
-Graphs*. It starts from the HPRC release 2.1 graphs and the GIAB reads and ends with the tables in `<workdir>/results/`.
+This workflow reproduces the results of the paper *Colored Pebbling for Topology-Aware Indexing and Personalization of Pangenome
+Graphs*, all but the supplement's "Thinning the pebble index at random" (Table 2), an earlier protocol. It starts from the HPRC release 2.1 graphs and the GIAB reads and ends with the tables in `<workdir>/results/`.
 
 The paper uses two gpeb commands. **gpeb call** names the sample behind a set of reads (`gpeb --set-call mode`); **gpeb cover**
 builds a personalized graph from them (`gpeb --set-call cover`).
 
 | target | paper | results |
 |---|---|---|
-| `index_study` | Results "The pebble index"; supplement "Colors of the records" (Fig. 5), "Index parameters sweep" (Table 2) | `exp1/<chrom>.{index,calls,rare}.tsv` |
-| `calls` | Results "Calling the donor" (Fig. 2); supplement "Calling the donor" (Fig. 6) | `exp2/<chrom>.tsv` |
-| `whole_genome` | Results "Whole genome" (Fig. 3); supplement "Calling the donor on the whole genome" (Table 3) | `wg/{hifi,sr}.tsv`, `wg/{hifi,sr}.chroms.tsv`, `wg/index.tsv` |
-| `personalize` | Results "Personalized graphs" (Fig. 4, Table 1); supplement "Personalized graphs" | `exp3/<chrom>.{tsv,paired.tsv,extra.tsv,paired_extra.tsv}` |
+| `index_study` | Results "The pebble index"; supplement "Colors of the records" (Fig. 5), "Index parameters sweep" (Table 3) | `exp1/<chrom>.{index,calls,rare}.tsv` |
+| `calls` | Results "Calling the donor with gpeb call" (Fig. 2); supplement "Calling the donor" (Fig. 6) | `exp2/<chrom>.tsv` |
+| `whole_genome` | Results "Calling the donor with gpeb call", whole genome (Fig. 3); supplement "Calling the donor on the whole genome from unaligned reads" (Table 4) | `wg/{hifi,sr}.tsv`, `wg/{hifi,sr}.chroms.tsv`, `wg/index.tsv` |
+| `personalize` | Results "Personalized graphs with gpeb cover" (Fig. 4, Table 1); supplement "Personalized graphs" (Tables 5, 6) | `exp3/<chrom>.{tsv,paired.tsv,extra.tsv,paired_extra.tsv}` |
 | every target | Table 1 and the costs in the text | `bench.tsv`, `sizes.tsv` |
 
 ## Before you start
@@ -38,12 +38,12 @@ workflow runs all four. Set `cores` and `mem_gb` in `profiles/local/config.yaml`
 index is judged by gpeb call on HG002's and HG005's reads, and by gpeb cover on the parents' reads.
 
 **`calls`** runs gpeb call on every read set: HiFi and short reads of each sample, one chromosome at a time, at coverages from 0.5x
-to 30x. It calls each set twice, on the full graph and on the graph without HG002, where the right answer is no longer there.
+to 30x. It calls each set twice, on the full graph and on the noHG002 graph, which lacks HG002's two haplotypes.
 
 **`whole_genome`** does the same without an aligner. It takes every read of GIAB's raw files, finds the chromosome each read fits
 best, and runs one gpeb call over the whole genome. It needs the graphs of all 23 chromosomes.
 
-**`personalize`** builds personalized graphs for HG002 from the graph without HG002: gpeb cover, vg haplotypes, random haplotypes,
+**`personalize`** builds personalized graphs for HG002 from the noHG002 graph: the cover graph of gpeb cover, vg haplotypes, random haplotypes,
 and the whole graph as a baseline. It maps HG002's reads on each with vg giraffe and compares them read by read. One job, chr22's
 cover with 32 colors, needs 512 GB of memory; drop chr22 from `chroms` if your machine has less.
 

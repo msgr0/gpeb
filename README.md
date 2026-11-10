@@ -6,7 +6,7 @@ Graph pebbling for pangenome graphs: path inference and graph personalization.
 
 From a pangenome GFA, `gpeb` finds the *pebbles* (the junctions that tell the
 haplotype walks apart) and indexes their k-mers. With that index, **gpeb call** says
-which sample a read set comes from, and **gpeb cover** builds a small personalized
+which sample of the graph is closest to a read set, and **gpeb cover** builds a small personalized
 graph for a sample from its reads.
 
 ## Install
@@ -46,7 +46,7 @@ belongs to and the `2 * span` bp window across it.
 gpeb --span 60 graph.gfa > graph.peb
 ```
 
-**2. Index, once per graph.** Writes a k-mer to haplotype-set index.
+**2. Pebble index, once per graph.** Writes a k-mer to haplotype-set index.
 
 ```bash
 gpeb --index 31 --syncmer 16 --threads 16 graph-index.pex graph.gfa
@@ -74,8 +74,8 @@ and `pi`, each sample's share of the reads.
 ### gpeb cover (personalized graph)
 
 For a sample that is not in the panel, `--set-call cover` picks, per 200 kb window, the
-few haplotypes that carry most of the reads' index hits, and writes the graph made of
-them plus the references. The index must be built with positions on a reference colour
+few haplotypes that carry most of the reads' index hits, and writes the *cover graph*:
+those haplotypes plus the references. The index must be built with positions on a reference color
 (`--mosaic-ref`):
 
 ```bash
