@@ -90,6 +90,11 @@ This writes `sample.path.tsv` (the painting), `sample.sets.tsv` (the picks of ev
 window) and `sample.gfa`, a graph a short-read or HiFi aligner such as `vg giraffe`
 can map to. Paired short reads: add `--mate R2.fq.gz`.
 
+## Reproducing the paper
+
+[`workflows/recomb27`](workflows/recomb27) is the Snakemake workflow behind every result of the
+RECOMB 2027 paper, from the HPRC release 2.1 graphs and GIAB reads; see its `README.md`.
+
 ## Other commands
 
 Not covered above; each is described by `./gpeb --help`.
@@ -108,11 +113,6 @@ Not covered above; each is described by `./gpeb --help`.
 - Splitting a large panel into one index per group: `--split-colors`, `--split-max-colors`,
   `--split-walk`, `--split-shared`, `--split-exclude`, `--split-dry-run`
 - Diagnostics: `--kmer-stats`, `--pebble-ambiguity`, `--panel-jaccard`
-
-## Reproducing the paper
-
-[`workflows/recomb27`](workflows/recomb27) is the Snakemake workflow behind every result of the
-RECOMB 2027 paper, from the HPRC release 2.1 graphs and GIAB reads; see its `README.md`.
 
 ## License
 
