@@ -1,6 +1,0 @@
-# Fir (Alliance) paths, on top of config/config.yaml:  snakemake [target] --profile profiles/slurm --configfile config/config.yaml config/fir.yaml
-workdir: /scratch/msgro/graphling/r27/v4
-gfa_dir: /scratch/msgro/graphling/data/all          # the HPRC release 2.1 GFAs, byte-identical to pasteur's
-vg: /scratch/msgro/graphling/bin/vg-1.78.0
-kmc: /scratch/msgro/graphling/bin/kmc-3.2.4/bin/kmc
-time_bin: /cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/time

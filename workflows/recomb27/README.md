@@ -108,5 +108,5 @@ With `snakemake-executor-plugin-slurm` installed, every job becomes its own Slur
 snakemake <target> --profile profiles/slurm --configfile config/config.yaml config/<overlay>.yaml
 ```
 
-Set `slurm_account` and the run times in `profiles/slurm/config.yaml`, and the partition names in `rules/slurm.smk`, to your
+Set `slurm_account` (and `slurm_partition`, if your cluster needs one) and the run times in `profiles/slurm/config.yaml` to your
 cluster's. Run the controller in a login shell (`bash -lc`): the plugin needs `sacctmgr` on PATH.

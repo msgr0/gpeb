@@ -1,15 +1,15 @@
-# Alliance clusters (Fir, Narval), every rule its own Slurm job (snakemake-executor-plugin-slurm):
-#   snakemake [target] --profile profiles/slurm --configfile config/config.yaml config/fir.yaml
+# A Slurm cluster, every rule its own Slurm job (snakemake-executor-plugin-slurm):
+#   snakemake [target] --profile profiles/slurm --configfile config/config.yaml config/<overlay>.yaml
 # Run the controller in a login shell (bash -lc): the plugin needs sacctmgr on PATH. Each job asks for the rule's threads and mem_gb
-# (rules/slurm.smk copies it to mem_mb and picks the partition). runtime needs a unit: Snakemake 9 reads a bare number as seconds.
+# (rules/slurm.smk copies it to mem_mb). runtime needs a unit: Snakemake 9 reads a bare number as seconds.
 executor: slurm
 jobs: 40
-latency-wait: 120                  # Lustre
+latency-wait: 120                  # shared filesystems
 keep-going: true
 rerun-incomplete: true
 rerun-triggers: mtime
 default-resources:
-  - slurm_account=def-chauvec_cpu
+  - slurm_account=CHANGEME       # your Slurm account (and slurm_partition=..., if your cluster needs one)
   - runtime=179m
   - net=1
 set-resources:

@@ -1,5 +1,5 @@
-# RECOMB 2027 configuration. The paths are generic: config/pasteur.yaml, config/fir.yaml and config/narval.yaml set those of the
-# machines the paper ran on (snakemake [target] ... --configfile config/config.yaml config/<site>.yaml).
+# RECOMB 2027 configuration. The paths are generic: an overlay sets those of a machine (config/pasteur.yaml, the paper's):
+#   snakemake [target] ... --configfile config/config.yaml config/<overlay>.yaml
 workdir: work                   # every intermediate file and results/ (the paper: 1.4 TB per-chromosome, ~200 GB whole-genome)
 chroms: [chr21, chr22, chr16, chr9, chr19, chr3, chr1, chr2, chr8, chr6]   # sizes and structure: chr22, chr2, chr19, chr8 have the largest snarls, chr6 the MHC
 samples: [HG002, HG003, HG004, HG005]

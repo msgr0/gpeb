@@ -16,7 +16,7 @@ VG = config["vg"] or f"{W}/bin/vg"                             # empty: the vg r
 VGIN = [] if config["vg"] else [f"{W}/bin/vg"]                  # ... and then an input of every rule that runs it
 KMC = config["kmc"] or "kmc"
 TIME = config["time_bin"] + " -f '%e\\t%M\\t%U\\t%S' -o"
-# On a Slurm node vg mmaps its distance index, which crawls on Lustre (Fir: 0.5 cores for 2 h): copy it to the node's disk first.
+# On a Slurm node vg mmaps its distance index, which crawls on a shared filesystem: copy it to the node's disk first.
 # No-op where SLURM_TMPDIR is unset. Use: {LOCAL}D=$(L {input.dist}); vg ... -d $D   (cp -p: giraffe refuses a .dist newer than its .min)
 LOCAL = 'L() { if [ -n "${SLURM_TMPDIR:-}" ]; then cp -p "$1" "$SLURM_TMPDIR/" && echo "$SLURM_TMPDIR/$(basename "$1")"; else echo "$1"; fi; }; '
 bench = lambda name, key: f"{W}/bench/{name}__{{chrom}}__{key}.time"
