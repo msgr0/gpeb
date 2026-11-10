@@ -1,8 +1,7 @@
 # RECOMB 2027 workflow
 
 Every result of the paper *Colored Pebbling for Topology-Aware Indexing and Personalization of Pangenome Graphs*, from the HPRC
-release 2.1 graphs and GIAB reads to the tables in `<workdir>/results/`; `scripts/tex_numbers.py` prints from them the numbers of
-the text and tables.
+release 2.1 graphs and GIAB reads to the tables in `<workdir>/results/`.
 
 | target | paper | results |
 |---|---|---|
@@ -12,61 +11,87 @@ the text and tables.
 | `personalize` | Results "Personalized graphs" (Fig. 4, Table 1); supplement "Personalized graphs" (read classes, bases) | `exp3/<chrom>.{tsv,paired.tsv,extra.tsv,paired_extra.tsv}` |
 | every target | Table 1 and the costs in the text | `bench.tsv` (time and peak memory of every command), `sizes.tsv` (every index and graph) |
 
-`all` (the default) runs the four.
+## Setup
 
-## What it does
-
-- **gpeb** and `pex_rare` are built from this repository at `gpeb_commit` (default `HEAD`; `bin/COMMIT` records it and the binary's sha256).
-- **Graphs**: per chromosome, the released GFA (`full`, 464 colors) and the graph without HG002's two haplotypes (`noHG002`,
-  `scripts/prune_gfa.py`: drops the walks, then the segments and links no remaining walk uses).
-- **Index**: `gpeb --index 31 --min-gap 60 --syncmer 16 --mosaic-ref GRCh38` (the default), plus the sweep of `exp1` in the config.
-- **Per-chromosome reads**: GIAB HiFi (CHM13-aligned) and Element short reads (GRCh38-aligned), one chromosome sliced from the remote
-  BAM with samtools, cut into a nested ladder 0.5-30x by a hash of the read name (`scripts/subset.py`).
-- **Calls**: `gpeb --top 0 --classify 31 <reads> --set-call mode`; its log holds the call, every sample's share F, and the margin D and
-  share pi of the call (`set-call[conf]`); `scripts/call_aggregate.py` makes one row per call.
-- **Whole genome**: every read of the raw files (PacBio uBAMs, Element FASTQs, streamed from NCBI) cut into whole-genome rungs by the
-  same hash (`scripts/wg_reads.py`), called against each of the 23 chromosomes' indexes, kept on its best chromosome and called once
-  over all (`scripts/wg_sets.py`, `scripts/conf.py`), on every read and on the reads with >= 5 hits (`wg_min_hits`).
-- **Personalized graphs**: on noHG002, from HG002's HiFi reads: `gpeb --set-call cover --cover-max N` spliced into a GFA, against
-  `vg haplotypes` (KMC k-mers, N haplotypes or the diploid sample), N random haplotypes and the whole graph; every graph mapped with
-  `vg giraffe -b hifi`, edits per read by `scripts/edits.py`, compared read by read by `scripts/exp3_aggregate.py` and `exp3_extra.py`.
-
-## Requirements
-
-- `environment.yaml` (`conda env create -f environment.yaml`): Snakemake, samtools, kmc, Python with numpy, a C compiler,
-  make, zlib, curl and GNU time (`time_bin`); plus git (the build archives this repository) and network access to NCBI's GIAB FTP.
-- vg 1.78.0: `vg` in the config points to the binary, or leave it empty to download the release.
-- The HPRC release 2.1 Minigraph-Cactus GRCh38 graph split per chromosome, one `<chrom>.gfa` per chromosome in `gfa_dir`
-  (chromosomes 1-22 and X).
-- With Slurm: `snakemake-executor-plugin-slurm`.
+1. The environment: `conda env create -f environment.yaml && conda activate gpeb-recomb27` (Snakemake, samtools, kmc, Python with
+   numpy, a C compiler, make, zlib, curl, GNU time). git must be on PATH: gpeb is built from this repository at `gpeb_commit`.
+2. The graphs: the HPRC release 2.1 Minigraph-Cactus GRCh38 graph split per chromosome, one `<chrom>.gfa` per chromosome in
+   `gfa_dir`.
+3. The paths, in `config/config.yaml` or in an overlay of your own passed after it (`config/pasteur.yaml` is the paper's):
+   `workdir` (every intermediate file and `results/`), `gfa_dir`, `vg` (empty: vg 1.78.0 is downloaded), `kmc` (empty: on PATH).
+4. Network access to NCBI's GIAB FTP: the reads are streamed from it, never downloaded whole.
 
 ## Running
 
-From this directory, with `gfa_dir` and `workdir` set in `config/config.yaml` (or in an overlay of your own):
+From this directory:
 
 ```bash
-snakemake --profile profiles/local -n                     # what would run
-snakemake --profile profiles/local                        # everything, on one machine (cores and memory in profiles/local)
-snakemake calls --profile profiles/local                  # one target
+snakemake <target> --profile profiles/local --configfile config/config.yaml [config/<overlay>.yaml]
 ```
 
-The paper ran on pasteur (64 cores, 251 GB) and on the Alliance clusters, with the paths of `config/pasteur.yaml`,
-`config/fir.yaml` and `config/narval.yaml`:
+Add `-n` to list the jobs without running them. The target comes right after `snakemake`: `--configfile` takes several files and
+would swallow it. Without a target, `all` runs the four below. `profiles/local` runs on one machine: set `cores` and the memory cap
+(`resources: mem_gb`) to yours; each job's memory comes from the `mem_gb_*` keys of the config.
+
+### `index_study`
+
+On the full graph of each chromosome in `chroms`: the default index (`index`: k 31, min-gap 60, syncmer 16, mosaic reference
+GRCh38) and a sweep around it, one parameter at a time (`exp1`: min-gap and syncmer rebuilds, indexes cut to the k-mers of at most
+`max_colours` colors). Every index is scored by the rank calls of HG002 and HG005 and by the cover of the parents' reads at
+`exp1.call_covs`; `--cover-min-frac` is swept on the default index (`exp1.min_fracs`).
 
 ```bash
-snakemake --profile profiles/local --configfile config/config.yaml config/pasteur.yaml
-snakemake whole_genome --profile profiles/slurm --configfile config/config.yaml config/fir.yaml   # on Fir (run in `bash -lc`)
+snakemake index_study --profile profiles/local --configfile config/config.yaml
 ```
 
-Targets come right after `snakemake`: `--configfile` and `--resources` take several values and would swallow them. Rules declare
-`mem_gb` from measured peaks; `profiles/local` caps their sum, `rules/slurm.smk` turns them into Slurm requests.
-Then:
+### `calls`
+
+The donor call (`gpeb --top 0 --classify 31 <reads> --set-call mode`) of every read set on the default index of the full graph
+and of the graph without HG002 (`noHG002`). The read sets: each sample of `samples`, HiFi (`hifi_bam`) and short reads (`sr_bam`),
+one chromosome sliced from GIAB's aligned BAMs with samtools and cut into the coverages of `covs`. `expect` names the sample each
+set should call.
+
+```bash
+snakemake calls --profile profiles/local --configfile config/config.yaml
+```
+
+### `whole_genome`
+
+Every read of GIAB's raw files (`wg_ubam`: PacBio HiFi uBAMs; `wg_fastq`: Element FASTQs), cut into the whole-genome coverages of
+`wg_covs`, classified against the default index of each chromosome of `wg_chroms`, kept on the chromosome where it has the most
+hits and called once over the genome, on the full graphs and on noHG002; again on the reads with at least `wg_min_hits` hits.
+Needs a GFA for each of the 23 chromosomes of `wg_chroms`. The reads stream from `giab_base`; `wg_base` points to a local copy
+instead.
+
+```bash
+snakemake whole_genome --profile profiles/local --configfile config/config.yaml
+```
+
+### `personalize`
+
+On noHG002, from HG002's HiFi reads at each coverage of `covs`: the personalized graph of `gpeb --set-call cover` with at most N
+colors per window (`cover_caps`), the graphs of `vg haplotypes` from KMC k-mers (`vg_cfgs`: `d32` the diploid sample, `sN` N
+haplotypes; `kmc_ci`), N random haplotypes (`random_ns`, `random_seeds`) and the whole noHG002 graph. The reads are mapped on
+every graph with `vg giraffe -b hifi` and compared read by read.
+
+```bash
+snakemake personalize --profile profiles/local --configfile config/config.yaml
+```
+
+The distance index of chromosome 22's cover with 32 colors asks for 512 GB (`mem_gb_gdist`): lower `cover_caps`, drop chr22
+from `chroms`, or run that job on a machine with the memory.
+
+### The numbers of the paper
 
 ```bash
 python3 scripts/tex_numbers.py <workdir>/results
 ```
 
-**A quick check** (`config/smoke.yaml`: chr21, HG002 and HG003, 0.5x and 1x, one sweep setting, N = 4), about an hour:
+prints, from the tables of the four targets, the numbers of the text and the tables.
+
+## Quick check
+
+`config/smoke.yaml`: chr21, HG002 and HG003, 0.5x and 1x, one sweep setting, N = 4.
 
 ```bash
 snakemake calls index_study personalize --profile profiles/local --configfile config/config.yaml config/smoke.yaml
@@ -75,14 +100,13 @@ snakemake calls index_study personalize --profile profiles/local --configfile co
 Self-tests of the scripts: `python3 scripts/<name>.py --selftest` for `subset.py`, `call_aggregate.py`, `wg_sets.py`, and
 `python3 scripts/conf.py`.
 
-## Cost
+## On Slurm
 
-Measured on pasteur (two 16-core EPYC 7301, 251 GB) and the Alliance clusters:
+With `snakemake-executor-plugin-slurm` installed, every job becomes its own Slurm job:
 
-- The 23 indexes of the full graphs: 7 h in all, at most 31 min and 59 GiB each; pruning HG002 out of a graph: up to 75 min, 2.4 GiB.
-- `vg haplotypes`' panel indexes of the ten chromosomes: 21 h, up to 170 GiB (chromosome 2's distance index).
-- A HiFi call: from 12 s at 0.5x to 4.5 min at 30x, under 2.5 GiB; whole-genome calls: about 40 CPU hours per read type and graph.
-- The distance index of chromosome 22's cover with 32 colors takes 3-4.5 h and up to 450 GiB at 5-30x: run it on a large-memory node
-  (`mem_gb_gdist`); every other job fits in 230 GB.
-- Disk: the whole-genome first pass keeps a fifth of every read (about 200 GB for the two read types); per-chromosome calls keep only
-  their logs.
+```bash
+snakemake <target> --profile profiles/slurm --configfile config/config.yaml config/<overlay>.yaml
+```
+
+Set `slurm_account` and the run times in `profiles/slurm/config.yaml`, and the partition names in `rules/slurm.smk`, to your
+cluster's. Run the controller in a login shell (`bash -lc`): the plugin needs `sacctmgr` on PATH.
