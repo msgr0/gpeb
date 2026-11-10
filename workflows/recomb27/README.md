@@ -20,7 +20,7 @@ Create the environment with `conda env create -f environment.yaml` and activate 
 the workflow builds gpeb from this repository, and network access to NCBI, because the reads are streamed from GIAB's FTP.
 
 Put the HPRC graph, split per chromosome, in a folder as `<chrom>.gfa`. Then tell the workflow where things are, in
-`config/config.yaml` or in a small overlay file of your own (`config/pasteur.yaml` is the one we used): `gfa_dir` is the folder of
+`config/config.yaml` or in a small overlay file of your own (`config/pasteur.yaml` is our machine yaml): `gfa_dir` is the folder of
 the graphs and `workdir` is where everything is written. vg is downloaded unless `vg` points to a binary.
 
 ## Running
