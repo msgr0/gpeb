@@ -1,11 +1,12 @@
 // pex_bycolour -- a .pex index turned around: colour -> the rare k-mers it touches.
 //
 // A .pex record is k-mer -> colour mask. This writes the inverse as a FASTA-like
-// file, one record per colour (index order): the header is the colour name and the
-// single sequence line is the comma-separated list of the k-mers whose mask has that
-// colour, rarest first (fewest colours touching the k-mer), ties in key order.
+// file, one record per colour (index order): the header is the colour name, a space
+// and how many distinct k-mers are listed for it; the single sequence line is the
+// comma-separated list of the k-mers whose mask has that colour, rarest first (fewest
+// colours touching the k-mer), ties in key order.
 //
-//   >HG002#1
+//   >HG002#1 1234
 //   ACGT...,GGCA...,...
 //
 // Only k-mers touched by at most MAX colours are listed (default 10): the full
@@ -15,6 +16,9 @@
 //
 //   cc -O2 -o pex_bycolour pex_bycolour.c
 //   ./pex_bycolour [--max 10] <file.pex> > by_colour.fa      # PEX2..PEX5
+//
+// stderr ends with the distinct k-mers in the index (any colour), how many of them
+// are listed (1..MAX colours), and the colour entries written (a k-mer once per colour).
 //
 // All kept records are held in memory (8 + 8*ceil(nc/64) bytes each). See pex_rare.c
 // for the same records as k-mer -> colours rows.
@@ -60,13 +64,18 @@ int main(int argc, char **argv) {
   NW = (nc + 63) / 64; if (!NW) NW = 1;
   fprintf(stderr, "k=%u s=%u nc=%u n=%llu\n", k, sk, nc, (unsigned long long)n);
 
-  size_t rw = 1 + NW, nk = 0, cap = 1 << 20;
+  size_t rw = 1 + NW, nk = 0, tot = 0, cap = 1 << 20;  // tot: distinct k-mers with >= 1 colour
   uint64_t *rec = malloc(cap * rw * 8), *buf = malloc(rw * 8);
+  uint64_t *cnt = calloc(NW * 64, 8);                   // per colour; NW*64 so a stray high bit stays in bounds
   for (uint64_t i = 0; i < n; i++) {
     if (fread(buf, 8, rw, f) != rw) { fprintf(stderr, "pex_bycolour: short read at %llu\n", (unsigned long long)i); return 1; }
     if (v5) fseek(f, 2, SEEK_CUR);                      // uint16 block id
     uint32_t pc = popc(buf);
-    if (!pc || pc > max) continue;
+    if (!pc) continue;
+    tot++;                                              // keys are unique in a .pex
+    if (pc > max) continue;
+    for (uint32_t w = 0; w < NW; w++)
+      for (uint64_t x = buf[1 + w]; x; x &= x - 1) cnt[w * 64 + __builtin_ctzll(x)]++;
     if (nk == cap) { cap *= 2; rec = realloc(rec, cap * rw * 8); if (!rec) { perror("realloc"); return 1; } }
     memcpy(rec + nk++ * rw, buf, rw * 8);
   }
@@ -77,7 +86,7 @@ int main(int argc, char **argv) {
   char *s = malloc(k + 1); s[k] = 0;
   uint64_t entries = 0;
   for (uint32_t c = 0; c < nc; c++) {
-    printf(">%s\n", name[c]);
+    printf(">%s %llu\n", name[c], (unsigned long long)cnt[c]);
     for (size_t i = 0, first = 1; i < nk; i++) {
       const uint64_t *r = rec + i * rw;
       if (!(r[1 + c / 64] >> (c % 64) & 1)) continue;
@@ -86,7 +95,7 @@ int main(int argc, char **argv) {
     }
     putchar('\n');
   }
-  fprintf(stderr, "%zu k-mers with 1..%u colours, %llu colour entries over %u colours\n",
-          nk, max, (unsigned long long)entries, nc);
+  fprintf(stderr, "%zu distinct k-mers in the index, %zu of them with 1..%u colours (listed), "
+          "%llu colour entries over %u colours\n", tot, nk, max, (unsigned long long)entries, nc);
   return 0;
 }
